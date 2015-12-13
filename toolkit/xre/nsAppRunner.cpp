@@ -49,6 +49,7 @@
 #include "prprf.h"
 #include "prproces.h"
 #include "prenv.h"
+#include "prtime.h"
 
 #include "nsIAppShellService.h"
 #include "nsIAppStartup.h"
@@ -758,9 +759,7 @@ bool gSafeMode = false;
  * singleton.
  */
 class nsXULAppInfo : public nsIXULAppInfo,
-#ifdef E10S_TESTING_ONLY
                      public nsIObserver,
-#endif
 #ifdef XP_WIN
                      public nsIWinAppHelper,
 #endif
@@ -776,9 +775,7 @@ public:
   NS_DECL_ISUPPORTS_INHERITED
   NS_DECL_NSIXULAPPINFO
   NS_DECL_NSIXULRUNTIME
-#ifdef E10S_TESTING_ONLY
   NS_DECL_NSIOBSERVER
-#endif
 #ifdef MOZ_CRASHREPORTER
   NS_DECL_NSICRASHREPORTER
   NS_DECL_NSIFINISHDUMPINGCALLBACK
@@ -791,9 +788,7 @@ public:
 NS_INTERFACE_MAP_BEGIN(nsXULAppInfo)
   NS_INTERFACE_MAP_ENTRY_AMBIGUOUS(nsISupports, nsIXULRuntime)
   NS_INTERFACE_MAP_ENTRY(nsIXULRuntime)
-#ifdef E10S_TESTING_ONLY
   NS_INTERFACE_MAP_ENTRY(nsIObserver)
-#endif
 #ifdef XP_WIN
   NS_INTERFACE_MAP_ENTRY(nsIWinAppHelper)
 #endif
@@ -997,7 +992,6 @@ static bool gBrowserTabsRemoteAutostart = false;
 static nsString gBrowserTabsRemoteDisabledReason;
 static bool gBrowserTabsRemoteAutostartInitialized = false;
 
-#ifdef E10S_TESTING_ONLY
 NS_IMETHODIMP
 nsXULAppInfo::Observe(nsISupports *aSubject, const char *aTopic, const char16_t *aData) {
   if (!nsCRT::strcmp(aTopic, "getE10SBlocked")) {
@@ -1011,7 +1005,6 @@ nsXULAppInfo::Observe(nsISupports *aSubject, const char *aTopic, const char16_t 
   }
   return NS_ERROR_FAILURE;
 }
-#endif
 
 NS_IMETHODIMP
 nsXULAppInfo::GetBrowserTabsRemoteAutostart(bool* aResult)
@@ -1028,24 +1021,6 @@ nsXULAppInfo::GetAccessibilityEnabled(bool* aResult)
 #else
   *aResult = false;
 #endif
-  return NS_OK;
-}
-
-NS_IMETHODIMP
-nsXULAppInfo::GetAccessibilityIsBlacklistedForE10S(bool* aResult)
-{
-  *aResult = false;
-#if defined(ACCESSIBILITY)
-#if defined(XP_WIN)
-  if (GetAccService() && mozilla::a11y::Compatibility::IsBlacklistedForE10S()) {
-    *aResult = true;
-  }
-#elif defined(XP_MACOSX)
-  if (GetAccService()) {
-    *aResult = true;
-  }
-#endif
-#endif // defined(ACCESSIBILITY)
   return NS_OK;
 }
 
@@ -4598,7 +4573,6 @@ XRE_IsContentProcess()
   return XRE_GetProcessType() == GeckoProcessType_Content;
 }
 
-#ifdef E10S_TESTING_ONLY
 static void
 LogE10sBlockedReason(const char *reason) {
   gBrowserTabsRemoteDisabledReason.Assign(NS_ConvertASCIItoUTF16(reason));
@@ -4611,7 +4585,6 @@ LogE10sBlockedReason(const char *reason) {
     console->LogStringMessage(msg.get());
   }
 }
-#endif
 
 enum {
   kE10sEnabledByUser = 0,
@@ -4622,6 +4595,21 @@ enum {
   kE10sDisabledForMacGfx = 5,
 };
 
+#ifdef XP_WIN
+const char* kAccessibilityLastRunDatePref = "accessibility.lastLoadDate";
+const char* kAccessibilityLoadedLastSessionPref = "accessibility.loadedInLastSession";
+#endif // XP_WIN
+const char* kForceEnableE10sPref = "browser.tabs.remote.force-enable";
+
+#ifdef XP_WIN
+static inline uint32_t
+PRTimeToSeconds(PRTime t_usec)
+{
+  PRTime usec_per_sec = PR_USEC_PER_SEC;
+  return uint32_t(t_usec /= usec_per_sec);
+}
+#endif // XP_WIN
+
 bool
 mozilla::BrowserTabsRemoteAutostart()
 {
@@ -4629,6 +4617,37 @@ mozilla::BrowserTabsRemoteAutostart()
     return gBrowserTabsRemoteAutostart;
   }
   gBrowserTabsRemoteAutostartInitialized = true;
+
+  bool disabledForA11y = false;
+#ifdef XP_WIN
+  /**
+   * Avoids enabling e10s if accessibility has recently loaded. Performs the
+   * following checks:
+   * 1) Checks a pref indicating if a11y loaded in the last session. This pref
+   * is set in nsBrowserGlue.js. If a11y was loaded in the last session we
+   * do not enable e10s in this session.
+   * 2) Accessibility stores a last run date (PR_IntervalNow) when it is
+   * initialized (see nsBaseWidget.cpp). We check if this pref exists and
+   * compare it to now. If a11y hasn't run in an extended period of time or
+   * if the date pref does not exist we load e10s.
+   */
+  disabledForA11y = Preferences::GetBool(kAccessibilityLoadedLastSessionPref, false);
+  if (!disabledForA11y  &&
+      Preferences::HasUserValue(kAccessibilityLastRunDatePref)) {
+    #define ONE_WEEK_IN_SECONDS (60*60*24*7)
+    uint32_t a11yRunDate = Preferences::GetInt(kAccessibilityLastRunDatePref, 0);
+    MOZ_ASSERT(0 != a11yRunDate);
+    // If a11y hasn't run for a period of time, clear the pref and load e10s
+    uint32_t now = PRTimeToSeconds(PR_Now());
+    uint32_t difference = now - a11yRunDate;
+    if (difference > ONE_WEEK_IN_SECONDS || !a11yRunDate) {
+      Preferences::ClearUser(kAccessibilityLastRunDatePref);
+    } else {
+      disabledForA11y = true;
+    }
+  }
+#endif // XP_WIN
+
   bool optInPref = Preferences::GetBool("browser.tabs.remote.autostart", false);
   bool trialPref = Preferences::GetBool("browser.tabs.remote.autostart.2", false);
   bool prefEnabled = optInPref || trialPref;
@@ -4640,40 +4659,38 @@ mozilla::BrowserTabsRemoteAutostart()
   } else {
     status = kE10sDisabledByUser;
   }
-#if !defined(E10S_TESTING_ONLY)
-  // When running tests with 'layers.offmainthreadcomposition.testing.enabled' and
-  // autostart set to true, return enabled.  These tests must be allowed to run
-  // remotely. Otherwise remote isn't allowed in non-nightly builds.
-  bool testPref = Preferences::GetBool("layers.offmainthreadcomposition.testing.enabled", false);
-  if (testPref && optInPref) {
-    gBrowserTabsRemoteAutostart = true;
-  }
+
+#ifdef E10S_TESTING_ONLY
+  bool e10sAllowed = true;
 #else
-  // Nightly builds, update gBrowserTabsRemoteAutostart based on all the
-  // e10s remote relayed prefs we watch.
-  bool disabledForA11y = Preferences::GetBool("browser.tabs.remote.disabled-for-a11y", false);
+  // When running tests with 'layers.offmainthreadcomposition.testing.enabled', e10s must be
+  // allowed because these tests must be allowed to run remotely.
+  // We are also allowing e10s to be enabled on Beta (which doesn't have E10S_TESTING_ONLY defined.
+  bool e10sAllowed = Preferences::GetDefaultCString("app.update.channel").EqualsLiteral("beta") ||
+                     gfxPrefs::GetSingleton().LayersOffMainThreadCompositionTestingEnabled();
+#endif
+
   // Disable for VR
   bool disabledForVR = Preferences::GetBool("dom.vr.enabled", false);
 
-  if (prefEnabled) {
+  if (e10sAllowed && prefEnabled) {
     if (disabledForA11y) {
       status = kE10sDisabledForAccessibility;
-      LogE10sBlockedReason("An accessibility tool is or was active. See bug 1115956.");
+      LogE10sBlockedReason("An accessibility tool is or was active. See bug 1198459.");
     } else if (disabledForVR) {
       LogE10sBlockedReason("Experimental VR interfaces are enabled");
     } else {
       gBrowserTabsRemoteAutostart = true;
     }
   }
-#endif
 
 #if defined(XP_MACOSX)
   // If for any reason we suspect acceleration will be disabled, disabled
   // e10s auto start on mac.
   if (gBrowserTabsRemoteAutostart) {
     // Check prefs
-    bool accelDisabled = Preferences::GetBool("layers.acceleration.disabled", false) &&
-                         !Preferences::GetBool("layers.acceleration.force-enabled", false);
+    bool accelDisabled = gfxPrefs::GetSingleton().LayersAccelerationDisabled() &&
+                         !gfxPrefs::LayersAccelerationForceEnabled();
 
     accelDisabled = accelDisabled || !nsCocoaFeatures::AccelerateByDefault();
 
@@ -4701,12 +4718,17 @@ mozilla::BrowserTabsRemoteAutostart()
       gBrowserTabsRemoteAutostart = false;
 
       status = kE10sDisabledForMacGfx;
-#ifdef E10S_TESTING_ONLY
       LogE10sBlockedReason("Hardware acceleration is disabled");
-#endif
     }
   }
 #endif // defined(XP_MACOSX)
+
+  // Uber override pref for manual testing purposes
+  if (Preferences::GetBool(kForceEnableE10sPref, false)) {
+    gBrowserTabsRemoteAutostart = true;
+    prefEnabled = true;
+    status = kE10sEnabledByUser;
+  }
 
   mozilla::Telemetry::Accumulate(mozilla::Telemetry::E10S_AUTOSTART, gBrowserTabsRemoteAutostart);
   mozilla::Telemetry::Accumulate(mozilla::Telemetry::E10S_AUTOSTART_STATUS, status);

@@ -273,9 +273,6 @@ MacroAssemblerCompat::compareExchangeToTypedIntArray(Scalar::Type arrayType, con
       case Scalar::Uint8:
         compareExchange8ZeroExtend(mem, oldval, newval, output.gpr());
         break;
-      case Scalar::Uint8Clamped:
-        compareExchange8ZeroExtend(mem, oldval, newval, output.gpr());
-        break;
       case Scalar::Int16:
         compareExchange16SignExtend(mem, oldval, newval, output.gpr());
         break;
@@ -316,9 +313,6 @@ MacroAssemblerCompat::atomicExchangeToTypedIntArray(Scalar::Type arrayType, cons
         atomicExchange8SignExtend(mem, value, output.gpr());
         break;
       case Scalar::Uint8:
-        atomicExchange8ZeroExtend(mem, value, output.gpr());
-        break;
-      case Scalar::Uint8Clamped:
         atomicExchange8ZeroExtend(mem, value, output.gpr());
         break;
       case Scalar::Int16:
@@ -442,6 +436,13 @@ MacroAssembler::Push(Register reg)
 }
 
 void
+MacroAssembler::Push(Register reg1, Register reg2, Register reg3, Register reg4)
+{
+    push(reg1, reg2, reg3, reg4);
+    adjustFrame(4 * sizeof(intptr_t));
+}
+
+void
 MacroAssembler::Push(const Imm32 imm)
 {
     push(imm);
@@ -502,20 +503,20 @@ MacroAssembler::reserveStack(uint32_t amount)
 // ===============================================================
 // Simple call functions.
 
-CodeOffsetLabel
+CodeOffset
 MacroAssembler::call(Register reg)
 {
     syncStackPtr();
     Blr(ARMRegister(reg, 64));
-    return CodeOffsetLabel(currentOffset());
+    return CodeOffset(currentOffset());
 }
 
-CodeOffsetLabel
+CodeOffset
 MacroAssembler::call(Label* label)
 {
     syncStackPtr();
     Bl(label);
-    return CodeOffsetLabel(currentOffset());
+    return CodeOffset(currentOffset());
 }
 
 void
@@ -533,7 +534,7 @@ MacroAssembler::call(ImmPtr imm)
 }
 
 void
-MacroAssembler::call(AsmJSImmPtr imm)
+MacroAssembler::call(wasm::SymbolicAddress imm)
 {
     vixl::UseScratchRegisterScope temps(this);
     const Register scratch = temps.AcquireX().asUnsized();
@@ -553,11 +554,11 @@ MacroAssembler::call(JitCode* c)
     blr(scratch64);
 }
 
-CodeOffsetLabel
+CodeOffset
 MacroAssembler::callWithPatch()
 {
     MOZ_CRASH("NYI");
-    return CodeOffsetLabel();
+    return CodeOffset();
 }
 void
 MacroAssembler::patchCall(uint32_t callerOffset, uint32_t calleeOffset)

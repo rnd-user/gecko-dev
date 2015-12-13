@@ -228,7 +228,6 @@ nsNSSComponent::nsNSSComponent()
   NS_ASSERTION( (0 == mInstanceCount), "nsNSSComponent is a singleton, but instantiated multiple times!");
   ++mInstanceCount;
   mShutdownObjectList = nsNSSShutDownList::construct();
-  mIsNetworkDown = false;
 }
 
 void
@@ -847,6 +846,11 @@ void nsNSSComponent::setValidationOptions(bool isInitialSetting,
   PublicSSLState()->SetOCSPStaplingEnabled(ocspStaplingEnabled);
   PrivateSSLState()->SetOCSPStaplingEnabled(ocspStaplingEnabled);
 
+  bool ocspMustStapleEnabled = Preferences::GetBool("security.ssl.enable_ocsp_must_staple",
+                                                    true);
+  PublicSSLState()->SetOCSPMustStapleEnabled(ocspMustStapleEnabled);
+  PrivateSSLState()->SetOCSPMustStapleEnabled(ocspMustStapleEnabled);
+
   CertVerifier::PinningMode pinningMode =
     static_cast<CertVerifier::PinningMode>
       (Preferences::GetInt("security.cert_pinning.enforcement_level",
@@ -922,8 +926,8 @@ GetNSSProfilePath(nsAutoCString& aProfilePath)
   nsresult rv = NS_GetSpecialDirectory(NS_APP_USER_PROFILE_50_DIR,
                                        getter_AddRefs(profileFile));
   if (NS_FAILED(rv)) {
-    MOZ_LOG(gPIPNSSLog, LogLevel::Error,
-           ("Unable to get profile directory - continuing with no NSS DB\n"));
+    NS_WARNING("NSS will be initialized without a profile directory. "
+               "Some things may not work as expected.");
     return NS_OK;
   }
 
@@ -946,6 +950,8 @@ GetNSSProfilePath(nsAutoCString& aProfilePath)
     return rv;
   }
 
+  MOZ_LOG(gPIPNSSLog, LogLevel::Debug,
+          ("NSS profile at '%s'\n", aProfilePath.get()));
   return NS_OK;
 }
 
@@ -1234,12 +1240,7 @@ nsNSSComponent::RandomUpdate(void* entropy, int32_t bufLen)
   return NS_OK;
 }
 
-static const char* const PROFILE_CHANGE_NET_TEARDOWN_TOPIC
-  = "profile-change-net-teardown";
-static const char* const PROFILE_CHANGE_NET_RESTORE_TOPIC
-  = "profile-change-net-restore";
 static const char* const PROFILE_BEFORE_CHANGE_TOPIC = "profile-before-change";
-static const char* const PROFILE_DO_CHANGE_TOPIC = "profile-do-change";
 
 NS_IMETHODIMP
 nsNSSComponent::Observe(nsISupports* aSubject, const char* aTopic,
@@ -1247,41 +1248,8 @@ nsNSSComponent::Observe(nsISupports* aSubject, const char* aTopic,
 {
   if (nsCRT::strcmp(aTopic, PROFILE_BEFORE_CHANGE_TOPIC) == 0) {
     MOZ_LOG(gPIPNSSLog, LogLevel::Debug, ("receiving profile change topic\n"));
-    DoProfileBeforeChange(aSubject);
-  }
-  else if (nsCRT::strcmp(aTopic, PROFILE_DO_CHANGE_TOPIC) == 0) {
-    if (someData && NS_LITERAL_STRING("startup").Equals(someData)) {
-      // The application is initializing against a known profile directory for
-      // the first time during process execution.
-      // However, earlier code execution might have already triggered NSS init.
-      // We must ensure that NSS gets shut down prior to any attempt to init
-      // it again. We use the same cleanup functionality used when switching
-      // profiles. The order of function calls must correspond to the order
-      // of notifications sent by Profile Manager (nsProfile).
-      DoProfileChangeNetTeardown();
-      DoProfileBeforeChange(aSubject);
-      DoProfileChangeNetRestore();
-    }
-
-    bool needsInit = true;
-
-    {
-      MutexAutoLock lock(mutex);
-
-      if (mNSSInitialized) {
-        // We have already initialized NSS before the profile came up,
-        // no need to do it again
-        needsInit = false;
-      }
-    }
-
-    if (needsInit) {
-      if (NS_FAILED(InitializeNSS())) {
-        MOZ_LOG(gPIPNSSLog, LogLevel::Error, ("Unable to Initialize NSS after profile switch.\n"));
-      }
-    }
-  }
-  else if (nsCRT::strcmp(aTopic, NS_XPCOM_SHUTDOWN_OBSERVER_ID) == 0) {
+    DoProfileBeforeChange();
+  } else if (nsCRT::strcmp(aTopic, NS_XPCOM_SHUTDOWN_OBSERVER_ID) == 0) {
 
     MOZ_LOG(gPIPNSSLog, LogLevel::Debug, ("nsNSSComponent: XPCom shutdown observed\n"));
 
@@ -1332,6 +1300,7 @@ nsNSSComponent::Observe(nsISupports* aSubject, const char* aTopic,
                prefName.EqualsLiteral("security.OCSP.GET.enabled") ||
                prefName.EqualsLiteral("security.pki.cert_short_lifetime_in_days") ||
                prefName.EqualsLiteral("security.ssl.enable_ocsp_stapling") ||
+               prefName.EqualsLiteral("security.ssl.enable_ocsp_must_staple") ||
                prefName.EqualsLiteral("security.cert_pinning.enforcement_level") ||
                prefName.EqualsLiteral("security.pki.sha1_enforcement_level")) {
       MutexAutoLock lock(mutex);
@@ -1341,14 +1310,6 @@ nsNSSComponent::Observe(nsISupports* aSubject, const char* aTopic,
     }
     if (clearSessionCache)
       SSL_ClearSessionCache();
-  }
-  else if (nsCRT::strcmp(aTopic, PROFILE_CHANGE_NET_TEARDOWN_TOPIC) == 0) {
-    MOZ_LOG(gPIPNSSLog, LogLevel::Debug, ("receiving network teardown topic\n"));
-    DoProfileChangeNetTeardown();
-  }
-  else if (nsCRT::strcmp(aTopic, PROFILE_CHANGE_NET_RESTORE_TOPIC) == 0) {
-    MOZ_LOG(gPIPNSSLog, LogLevel::Debug, ("receiving network restore topic\n"));
-    DoProfileChangeNetRestore();
   }
 
   return NS_OK;
@@ -1435,26 +1396,13 @@ nsNSSComponent::RegisterObservers()
   // least as long as the observer service.
   observerService->AddObserver(this, NS_XPCOM_SHUTDOWN_OBSERVER_ID, false);
   observerService->AddObserver(this, PROFILE_BEFORE_CHANGE_TOPIC, false);
-  observerService->AddObserver(this, PROFILE_DO_CHANGE_TOPIC, false);
-  observerService->AddObserver(this, PROFILE_CHANGE_NET_TEARDOWN_TOPIC, false);
-  observerService->AddObserver(this, PROFILE_CHANGE_NET_RESTORE_TOPIC, false);
 
   return NS_OK;
 }
 
 void
-nsNSSComponent::DoProfileChangeNetTeardown()
+nsNSSComponent::DoProfileBeforeChange()
 {
-  if (mCertVerificationThread)
-    mCertVerificationThread->requestExit();
-  mIsNetworkDown = true;
-}
-
-void
-nsNSSComponent::DoProfileBeforeChange(nsISupports* aSubject)
-{
-  NS_ASSERTION(mIsNetworkDown, "nsNSSComponent relies on profile manager to wait for synchronous shutdown of all network activity");
-
   bool needsCleanup = true;
 
   {
@@ -1471,15 +1419,6 @@ nsNSSComponent::DoProfileBeforeChange(nsISupports* aSubject)
   if (needsCleanup) {
     ShutdownNSS();
   }
-}
-
-void
-nsNSSComponent::DoProfileChangeNetRestore()
-{
-  // XXX this doesn't work well, since nothing expects null pointers
-  deleteBackgroundThreads();
-  createBackgroundThreads();
-  mIsNetworkDown = false;
 }
 
 NS_IMETHODIMP

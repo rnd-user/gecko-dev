@@ -264,6 +264,7 @@ NS_INTERFACE_MAP_END
 static uint32_t sESMInstanceCount = 0;
 static bool sPointerEventEnabled = false;
 
+uint64_t EventStateManager::sUserInputCounter = 0;
 int32_t EventStateManager::sUserInputEventDepth = 0;
 bool EventStateManager::sNormalLMouseEventInProcess = false;
 EventStateManager* EventStateManager::sActiveESM = nullptr;
@@ -279,6 +280,7 @@ nsWeakPtr EventStateManager::sPointerLockedElement;
 // Reference to the document which requested pointer lock.
 nsWeakPtr EventStateManager::sPointerLockedDoc;
 nsCOMPtr<nsIContent> EventStateManager::sDragOverContent = nullptr;
+TimeStamp EventStateManager::sLatestUserInputStart;
 TimeStamp EventStateManager::sHandlingInputStart;
 
 EventStateManager::WheelPrefs*
@@ -288,6 +290,7 @@ EventStateManager::DeltaAccumulator*
 
 EventStateManager::EventStateManager()
   : mLockCursor(0)
+  , mLastFrameConsumedSetCursor(false)
   , mPreLockPoint(0,0)
   , mCurrentTarget(nullptr)
     // init d&d gesture state machine variables
@@ -481,6 +484,30 @@ EventStateManager::TryToFlushPendingNotificationsToIME()
   }
 }
 
+static bool
+IsMessageMouseUserActivity(EventMessage aMessage)
+{
+  return aMessage == eMouseMove ||
+         aMessage == eMouseUp ||
+         aMessage == eMouseDown ||
+         aMessage == eMouseDoubleClick ||
+         aMessage == eMouseClick ||
+         aMessage == eMouseActivate ||
+         aMessage == eMouseLongTap;
+}
+
+static bool
+IsMessageGamepadUserActivity(EventMessage aMessage)
+{
+#ifndef MOZ_GAMEPAD
+  return false;
+#else
+  return aMessage == eGamepadButtonDown ||
+         aMessage == eGamepadButtonUp ||
+         aMessage == eGamepadAxisMove;
+#endif
+}
+
 nsresult
 EventStateManager::PreHandleEvent(nsPresContext* aPresContext,
                                   WidgetEvent* aEvent,
@@ -509,12 +536,12 @@ EventStateManager::PreHandleEvent(nsPresContext* aPresContext,
   WidgetMouseEvent* mouseEvent = aEvent->AsMouseEvent();
   if (aEvent->mFlags.mIsTrusted &&
       ((mouseEvent && mouseEvent->IsReal() &&
-        mouseEvent->mMessage != eMouseEnterIntoWidget &&
-        mouseEvent->mMessage != eMouseExitFromWidget) ||
+        IsMessageMouseUserActivity(mouseEvent->mMessage)) ||
        aEvent->mClass == eWheelEventClass ||
        aEvent->mClass == ePointerEventClass ||
        aEvent->mClass == eTouchEventClass ||
-       aEvent->mClass == eKeyboardEventClass)) {
+       aEvent->mClass == eKeyboardEventClass ||
+       IsMessageGamepadUserActivity(aEvent->mMessage))) {
     if (gMouseOrKeyboardEventCounter == 0) {
       nsCOMPtr<nsIObserverService> obs =
         mozilla::services::GetObserverService();
@@ -583,16 +610,16 @@ EventStateManager::PreHandleEvent(nsPresContext* aPresContext,
     case WidgetMouseEvent::eLeftButton:
       BeginTrackingDragGesture(aPresContext, mouseEvent, aTargetFrame);
       mLClickCount = mouseEvent->clickCount;
-      SetClickCount(aPresContext, mouseEvent, aStatus);
+      SetClickCount(mouseEvent, aStatus);
       sNormalLMouseEventInProcess = true;
       break;
     case WidgetMouseEvent::eMiddleButton:
       mMClickCount = mouseEvent->clickCount;
-      SetClickCount(aPresContext, mouseEvent, aStatus);
+      SetClickCount(mouseEvent, aStatus);
       break;
     case WidgetMouseEvent::eRightButton:
       mRClickCount = mouseEvent->clickCount;
-      SetClickCount(aPresContext, mouseEvent, aStatus);
+      SetClickCount(mouseEvent, aStatus);
       break;
     }
     break;
@@ -609,7 +636,7 @@ EventStateManager::PreHandleEvent(nsPresContext* aPresContext,
         MOZ_FALLTHROUGH;
       case WidgetMouseEvent::eRightButton:
       case WidgetMouseEvent::eMiddleButton:
-        SetClickCount(aPresContext, mouseEvent, aStatus);
+        SetClickCount(mouseEvent, aStatus);
         break;
     }
     break;
@@ -733,15 +760,17 @@ EventStateManager::PreHandleEvent(nsPresContext* aPresContext,
       if (content)
         mCurrentTargetContent = content;
 
-      // NOTE: Don't refer TextComposition::IsComposing() since DOM Level 3
-      //       Events defines that KeyboardEvent.isComposing is true when it's
+      // NOTE: Don't refer TextComposition::IsComposing() since UI Events
+      //       defines that KeyboardEvent.isComposing is true when it's
       //       dispatched after compositionstart and compositionend.
       //       TextComposition::IsComposing() is false even before
       //       compositionend if there is no composing string.
-      WidgetKeyboardEvent* keyEvent = aEvent->AsKeyboardEvent();
+      //       And also don't expose other document's composition state.
+      //       A native IME context is typically shared by multiple documents.
+      //       So, don't use GetTextCompositionFor(nsIWidget*) here.
       RefPtr<TextComposition> composition =
-        IMEStateManager::GetTextCompositionFor(keyEvent);
-      keyEvent->mIsComposing = !!composition;
+        IMEStateManager::GetTextCompositionFor(aPresContext);
+      aEvent->AsKeyboardEvent()->mIsComposing = !!composition;
     }
     break;
   case eWheel:
@@ -2982,10 +3011,15 @@ EventStateManager::PostHandleEvent(nsPresContext* aPresContext,
           if (newFocus && currFrame) {
             // use the mouse flag and the noscroll flag so that the content
             // doesn't unexpectedly scroll when clicking an element that is
-            // only hald visible
+            // only half visible
+            uint32_t flags = nsIFocusManager::FLAG_BYMOUSE |
+                             nsIFocusManager::FLAG_NOSCROLL;
+            // If this was a touch-generated event, pass that information:
+            if (mouseEvent->inputSource == nsIDOMMouseEvent::MOZ_SOURCE_TOUCH) {
+              flags |= nsIFocusManager::FLAG_BYTOUCH;
+            }
             nsCOMPtr<nsIDOMElement> newFocusElement = do_QueryInterface(newFocus);
-            fm->SetFocus(newFocusElement, nsIFocusManager::FLAG_BYMOUSE |
-                                          nsIFocusManager::FLAG_NOSCROLL);
+            fm->SetFocus(newFocusElement, flags);
           }
           else if (!suppressBlur) {
             // clear the focus within the frame and then set it as the
@@ -3080,7 +3114,7 @@ EventStateManager::PostHandleEvent(nsPresContext* aPresContext,
         }
         // Make sure to dispatch the click even if there is no frame for
         // the current target element. This is required for Web compatibility.
-        ret = CheckForAndDispatchClick(presContext, mouseEvent, aStatus);
+        ret = CheckForAndDispatchClick(mouseEvent, aStatus);
       }
 
       nsIPresShell *shell = presContext->GetPresShell();
@@ -3522,8 +3556,19 @@ EventStateManager::UpdateCursor(nsPresContext* aPresContext,
       nsIFrame::Cursor framecursor;
       nsPoint pt = nsLayoutUtils::GetEventCoordinatesRelativeTo(aEvent,
                                                                 aTargetFrame);
-      if (NS_FAILED(aTargetFrame->GetCursor(pt, framecursor)))
-        return;  // don't update the cursor if we failed to get it from the frame see bug 118877
+      // Avoid setting cursor when the mouse is over a windowless pluign.
+      if (NS_FAILED(aTargetFrame->GetCursor(pt, framecursor))) {
+        if (XRE_IsContentProcess()) {
+          mLastFrameConsumedSetCursor = true;
+        }
+        return;
+      }
+      // Make sure cursors get reset after the mouse leaves a
+      // windowless plugin frame.
+      if (mLastFrameConsumedSetCursor) {
+        ClearCachedWidgetCursor(aTargetFrame);
+        mLastFrameConsumedSetCursor = false;
+      }
       cursor = framecursor.mCursor;
       container = framecursor.mContainer;
       haveHotspot = framecursor.mHaveHotspot;
@@ -4509,8 +4554,7 @@ EventStateManager::UpdateDragDataTransfer(WidgetDragEvent* dragEvent)
 }
 
 nsresult
-EventStateManager::SetClickCount(nsPresContext* aPresContext,
-                                 WidgetMouseEvent* aEvent,
+EventStateManager::SetClickCount(WidgetMouseEvent* aEvent,
                                  nsEventStatus* aStatus)
 {
   nsCOMPtr<nsIContent> mouseContent;
@@ -4587,8 +4631,7 @@ EventStateManager::SetClickCount(nsPresContext* aPresContext,
 }
 
 nsresult
-EventStateManager::CheckForAndDispatchClick(nsPresContext* aPresContext,
-                                            WidgetMouseEvent* aEvent,
+EventStateManager::CheckForAndDispatchClick(WidgetMouseEvent* aEvent,
                                             nsEventStatus* aStatus)
 {
   nsresult ret = NS_OK;
@@ -5675,14 +5718,16 @@ EventStateManager::WheelPrefs::NeedToComputeLineOrPageDelta(
          (mMultiplierY[index] != 1.0 && mMultiplierY[index] != -1.0);
 }
 
-bool
-EventStateManager::WheelPrefs::HasUserPrefsForDelta(WidgetWheelEvent* aEvent)
+void
+EventStateManager::WheelPrefs::GetUserPrefsForEvent(WidgetWheelEvent* aEvent,
+                                                    double* aOutMultiplierX,
+                                                    double* aOutMultiplierY)
 {
   Index index = GetIndexFor(aEvent);
   Init(index);
 
-  return mMultiplierX[index] != 1.0 ||
-         mMultiplierY[index] != 1.0;
+  *aOutMultiplierX = mMultiplierX[index];
+  *aOutMultiplierY = mMultiplierY[index];
 }
 
 bool
@@ -5692,10 +5737,13 @@ EventStateManager::WheelEventIsScrollAction(WidgetWheelEvent* aEvent)
          WheelPrefs::GetInstance()->ComputeActionFor(aEvent) == WheelPrefs::ACTION_SCROLL;
 }
 
-bool
-EventStateManager::WheelEventNeedsDeltaMultipliers(WidgetWheelEvent* aEvent)
+void
+EventStateManager::GetUserPrefsForWheelEvent(WidgetWheelEvent* aEvent,
+                                             double* aOutMultiplierX,
+                                             double* aOutMultiplierY)
 {
-  return WheelPrefs::GetInstance()->HasUserPrefsForDelta(aEvent);
+  WheelPrefs::GetInstance()->GetUserPrefsForEvent(
+    aEvent, aOutMultiplierX, aOutMultiplierY);
 }
 
 bool

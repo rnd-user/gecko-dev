@@ -344,19 +344,15 @@ pref("image.mem.surfacecache.size_factor", 8);  // 1/8 of main memory
 pref("image.mem.surfacecache.discard_factor", 2);  // Discard 1/2 of the surface cache at a time.
 pref("image.mem.surfacecache.min_expiration_ms", 86400000); // 24h, we rely on the out of memory hook
 
-// XXX this isn't a good check for "are touch events supported", but
-// we don't really have a better one at the moment.
-// enable touch events interfaces
-pref("dom.w3c_touch_events.enabled", 1);
 pref("dom.w3c_touch_events.safetyX", 0); // escape borders in units of 1/240"
 pref("dom.w3c_touch_events.safetyY", 120); // escape borders in units of 1/240"
 
 #ifdef MOZ_SAFE_BROWSING
-pref("browser.safebrowsing.enabled", false);
+pref("browser.safebrowsing.enabled", true);
 // Prevent loading of pages identified as malware
-pref("browser.safebrowsing.malware.enabled", false);
-pref("browser.safebrowsing.downloads.enabled", false);
-pref("browser.safebrowsing.downloads.remote.enabled", false);
+pref("browser.safebrowsing.malware.enabled", true);
+pref("browser.safebrowsing.downloads.enabled", true);
+pref("browser.safebrowsing.downloads.remote.enabled", true);
 pref("browser.safebrowsing.downloads.remote.timeout_ms", 10000);
 pref("browser.safebrowsing.debug", false);
 
@@ -388,7 +384,7 @@ pref("urlclassifier.max-complete-age", 2700);
 
 // Tracking protection
 pref("privacy.trackingprotection.enabled", false);
-pref("privacy.trackingprotection.pbmode.enabled", false);
+pref("privacy.trackingprotection.pbmode.enabled", true);
 
 #endif
 
@@ -531,6 +527,9 @@ pref("layout.frame_rate.precise", true);
 
 // Handle hardware buttons in the b2g chrome package
 pref("b2g.keys.menu.enabled", true);
+
+// Display simulator software buttons
+pref("b2g.software-buttons", false);
 
 // Screen timeout in seconds
 pref("power.screen.timeout", 60);
@@ -1008,16 +1007,8 @@ pref("security.exthelperapp.disable_background_handling", true);
 // Inactivity time in milliseconds after which we shut down the OS.File worker.
 pref("osfile.reset_worker_delay", 5000);
 
-// APZC preferences.
-#ifdef MOZ_WIDGET_GONK
-pref("apz.allow_zooming", true);
-#endif
-
-// Gaia relies heavily on scroll events for now, so lets fire them
-// more often than the default value (100).
-pref("apz.pan_repaint_interval", 16);
-
 // APZ physics settings, tuned by UX designers
+pref("apz.axis_lock.mode", 2); // Use "sticky" axis locking
 pref("apz.fling_curve_function_x1", "0.41");
 pref("apz.fling_curve_function_y1", "0.0");
 pref("apz.fling_curve_function_x2", "0.80");
@@ -1025,29 +1016,7 @@ pref("apz.fling_curve_function_y2", "1.0");
 pref("apz.fling_curve_threshold_inches_per_ms", "0.01");
 pref("apz.fling_friction", "0.0019");
 pref("apz.max_velocity_inches_per_ms", "0.07");
-pref("apz.touch_start_tolerance", "0.1");
-
-#ifdef MOZ_WIDGET_GONK
-pref("apz.touch_move_tolerance", "0.03");
-#endif
-
-// Tweak default displayport values to reduce the risk of running out of
-// memory when zooming in
-pref("apz.x_skate_size_multiplier", "1.25");
-pref("apz.y_skate_size_multiplier", "1.5");
-pref("apz.x_stationary_size_multiplier", "1.5");
-pref("apz.y_stationary_size_multiplier", "1.8");
-pref("apz.enlarge_displayport_when_clipped", true);
-// Use "sticky" axis locking
-pref("apz.axis_lock.mode", 2);
-
-// Overscroll-related settings
 pref("apz.overscroll.enabled", true);
-pref("apz.overscroll.stretch_factor", "0.35");
-pref("apz.overscroll.spring_stiffness", "0.0018");
-pref("apz.overscroll.spring_friction", "0.015");
-pref("apz.overscroll.stop_distance_threshold", "5.0");
-pref("apz.overscroll.stop_velocity_threshold", "0.01");
 
 // For event-regions based hit-testing
 pref("layout.event-regions.enabled", true);
@@ -1087,6 +1056,9 @@ pref("identity.fxaccounts.enabled", true);
 
 // Mobile Identity API.
 pref("services.mobileid.server.uri", "https://msisdn.services.mozilla.com");
+
+pref("identity.fxaccounts.remote.oauth.uri", "https://oauth.accounts.firefox.com/v1");
+pref("identity.fxaccounts.remote.profile.uri", "https://profile.accounts.firefox.com/v1");
 
 // Enable mapped array buffer.
 #ifndef XP_WIN

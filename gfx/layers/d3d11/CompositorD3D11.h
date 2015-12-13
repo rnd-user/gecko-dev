@@ -157,8 +157,6 @@ private:
   };
 
   void HandleError(HRESULT hr, Severity aSeverity = DebugAssert);
-  bool Failed(HRESULT hr, Severity aSeverity = DebugAssert);
-  bool Succeeded(HRESULT hr, Severity aSeverity = DebugAssert);
 
   // Same as Failed(), except the severity is critical (with no abort) and
   // a string prefix must be provided.
@@ -199,6 +197,8 @@ private:
   // This is the clip rect applied to the default DrawTarget (i.e. the window)
   gfx::IntRect mCurrentClip;
   nsIntRegion mInvalidRegion;
+
+  bool mVerifyBuffersFailed;
 };
 
 }

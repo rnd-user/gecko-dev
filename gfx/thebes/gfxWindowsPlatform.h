@@ -185,7 +185,8 @@ public:
     CreateFontGroup(const mozilla::FontFamilyList& aFontFamilyList,
                     const gfxFontStyle *aStyle,
                     gfxTextPerfMetrics* aTextPerf,
-                    gfxUserFontSet *aUserFontSet) override;
+                    gfxUserFontSet *aUserFontSet,
+                    gfxFloat aDevToCssSize) override;
 
     /**
      * Look up a local platform font using the full font face name (needed to support @font-face src local() )
@@ -293,6 +294,11 @@ public:
     static mozilla::Atomic<size_t> sD3D9SharedTextureUsed;
 
     void GetDeviceInitData(mozilla::gfx::DeviceInitData* aOut) override;
+
+    bool SupportsPluginDirectBitmapDrawing() override {
+      return true;
+    }
+    bool SupportsPluginDirectDXGIDrawing();
 
 protected:
     bool AccelerateLayersByDefault() override {

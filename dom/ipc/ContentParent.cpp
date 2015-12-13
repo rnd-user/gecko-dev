@@ -31,10 +31,12 @@
 #include "BlobParent.h"
 #include "CrashReporterParent.h"
 #include "GMPServiceParent.h"
+#include "HandlerServiceParent.h"
 #include "IHistory.h"
 #include "imgIContainer.h"
 #include "mozIApplication.h"
 #include "mozilla/ClearOnShutdown.h"
+#include "mozilla/CSSStyleSheet.h"
 #include "mozilla/DataStorage.h"
 #include "mozilla/devtools/HeapSnapshotTempFileHelperParent.h"
 #include "mozilla/docshell/OfflineCacheUpdateParent.h"
@@ -67,7 +69,7 @@
 #include "mozilla/dom/power/PowerManagerService.h"
 #include "mozilla/dom/PresentationParent.h"
 #include "mozilla/dom/PPresentationParent.h"
-#include "mozilla/dom/quota/QuotaManager.h"
+#include "mozilla/dom/quota/QuotaManagerService.h"
 #include "mozilla/dom/telephony/TelephonyParent.h"
 #include "mozilla/dom/time/DateCacheCleaner.h"
 #include "mozilla/dom/voicemail/VoicemailParent.h"
@@ -137,16 +139,15 @@
 #include "nsIMutable.h"
 #include "nsIObserverService.h"
 #include "nsIPresShell.h"
+#include "nsIRemoteWindowContext.h"
 #include "nsIScriptError.h"
 #include "nsIScriptSecurityManager.h"
 #include "nsISiteSecurityService.h"
 #include "nsISpellChecker.h"
-#include "nsIStyleSheet.h"
 #include "nsISupportsPrimitives.h"
 #include "nsISystemMessagesInternal.h"
 #include "nsITimer.h"
 #include "nsIURIFixup.h"
-#include "nsIWindowMediator.h"
 #include "nsIDocShellTreeOwner.h"
 #include "nsIXULWindow.h"
 #include "nsIDOMChromeWindow.h"
@@ -268,6 +269,11 @@ using namespace mozilla::system;
 #endif
 
 static NS_DEFINE_CID(kCClipboardCID, NS_CLIPBOARD_CID);
+
+#if defined(XP_WIN)
+// e10s forced enable pref, defined in nsAppRunner.cpp
+extern const char* kForceEnableE10sPref;
+#endif
 
 using base::ChildPrivileges;
 using base::KillProcess;
@@ -1553,7 +1559,35 @@ ContentParent::Init()
     // If accessibility is running in chrome process then start it in content
     // process.
     if (nsIPresShell::IsAccessibilityActive()) {
+#if !defined(XP_WIN)
         Unused << SendActivateA11y();
+#else
+        // On Windows we currently only enable a11y in the content process
+        // for testing purposes.
+        if (Preferences::GetBool(kForceEnableE10sPref, false)) {
+            Unused << SendActivateA11y();
+        }
+#endif
+    }
+#endif
+
+#ifdef MOZ_ENABLE_PROFILER_SPS
+    nsCOMPtr<nsIProfiler> profiler(do_GetService("@mozilla.org/tools/profiler;1"));
+    bool profilerActive = false;
+    DebugOnly<nsresult> rv = profiler->IsActive(&profilerActive);
+    MOZ_ASSERT(NS_SUCCEEDED(rv));
+
+    if (profilerActive) {
+        nsCOMPtr<nsIProfilerStartParams> currentProfilerParams;
+        rv = profiler->GetStartParams(getter_AddRefs(currentProfilerParams));
+        MOZ_ASSERT(NS_SUCCEEDED(rv));
+
+        nsCOMPtr<nsISupports> gatherer;
+        rv = profiler->GetProfileGatherer(getter_AddRefs(gatherer));
+        MOZ_ASSERT(NS_SUCCEEDED(rv));
+        mGatherer = static_cast<ProfileGatherer*>(gatherer.get());
+
+        StartProfiler(currentProfilerParams);
     }
 #endif
 }
@@ -1568,7 +1602,7 @@ ContentParent::ForwardKnownInfo()
 #ifdef MOZ_WIDGET_GONK
     InfallibleTArray<VolumeInfo> volumeInfo;
     RefPtr<nsVolumeService> vs = nsVolumeService::GetSingleton();
-    if (vs && !mIsForBrowser) {
+    if (vs) {
         vs->GetVolumesForIPC(&volumeInfo);
         Unused << SendVolumes(volumeInfo);
     }
@@ -1669,6 +1703,47 @@ StaticAutoPtr<LinkedList<SystemMessageHandledListener> >
 
 NS_IMPL_ISUPPORTS(SystemMessageHandledListener,
                   nsITimerCallback)
+
+
+class RemoteWindowContext final : public nsIRemoteWindowContext
+                                , public nsIInterfaceRequestor
+{
+public:
+    explicit RemoteWindowContext(TabParent* aTabParent)
+    : mTabParent(aTabParent)
+    {
+    }
+
+    NS_DECL_ISUPPORTS
+    NS_DECL_NSIINTERFACEREQUESTOR
+    NS_DECL_NSIREMOTEWINDOWCONTEXT
+
+private:
+    ~RemoteWindowContext();
+    RefPtr<TabParent> mTabParent;
+};
+
+NS_IMPL_ISUPPORTS(RemoteWindowContext, nsIRemoteWindowContext, nsIInterfaceRequestor)
+
+RemoteWindowContext::~RemoteWindowContext()
+{
+}
+
+NS_IMETHODIMP
+RemoteWindowContext::GetInterface(const nsIID& aIID, void** aSink)
+{
+    return QueryInterface(aIID, aSink);
+}
+
+NS_IMETHODIMP
+RemoteWindowContext::OpenURI(nsIURI* aURI, uint32_t aFlags)
+{
+    URIParams uri;
+    SerializeURI(aURI, uri);
+
+    Unused << mTabParent->SendOpenURI(uri, aFlags);
+    return NS_OK;
+}
 
 } // namespace
 
@@ -1794,10 +1869,10 @@ ContentParent::ShutDownProcess(ShutDownMethod aMethod)
         return;
     }
 
-    using mozilla::dom::quota::QuotaManager;
+    using mozilla::dom::quota::QuotaManagerService;
 
-    if (QuotaManager* quotaManager = QuotaManager::Get()) {
-        quotaManager->AbortOperationsForProcess(mChildID);
+    if (QuotaManagerService* quotaManagerService = QuotaManagerService::Get()) {
+        quotaManagerService->AbortOperationsForProcess(mChildID);
     }
 
     // If Close() fails with an error, we'll end up back in this function, but
@@ -2072,6 +2147,12 @@ ContentParent::ActorDestroy(ActorDestroyReason why)
     RecvRemoveGeolocationListener();
 
     mConsoleService = nullptr;
+
+#ifdef MOZ_ENABLE_PROFILER_SPS
+    if (mGatherer && !mProfile.IsEmpty()) {
+        mGatherer->OOPExitProfile(mProfile);
+    }
+#endif
 
     if (obs) {
         RefPtr<nsHashPropertyBag> props = new nsHashPropertyBag();
@@ -2575,24 +2656,21 @@ ContentParent::InitInternal(ProcessPriority aInitialPriority,
         // This looks like a lot of work, but in a normal browser session we just
         // send two loads.
 
-        nsCOMArray<nsIStyleSheet>& agentSheets = *sheetService->AgentStyleSheets();
-        for (uint32_t i = 0; i < agentSheets.Length(); i++) {
+        for (CSSStyleSheet* sheet : *sheetService->AgentStyleSheets()) {
             URIParams uri;
-            SerializeURI(agentSheets[i]->GetSheetURI(), uri);
+            SerializeURI(sheet->GetSheetURI(), uri);
             Unused << SendLoadAndRegisterSheet(uri, nsIStyleSheetService::AGENT_SHEET);
         }
 
-        nsCOMArray<nsIStyleSheet>& userSheets = *sheetService->UserStyleSheets();
-        for (uint32_t i = 0; i < userSheets.Length(); i++) {
+        for (CSSStyleSheet* sheet : *sheetService->UserStyleSheets()) {
             URIParams uri;
-            SerializeURI(userSheets[i]->GetSheetURI(), uri);
+            SerializeURI(sheet->GetSheetURI(), uri);
             Unused << SendLoadAndRegisterSheet(uri, nsIStyleSheetService::USER_SHEET);
         }
 
-        nsCOMArray<nsIStyleSheet>& authorSheets = *sheetService->AuthorStyleSheets();
-        for (uint32_t i = 0; i < authorSheets.Length(); i++) {
+        for (CSSStyleSheet* sheet : *sheetService->AuthorStyleSheets()) {
             URIParams uri;
-            SerializeURI(authorSheets[i]->GetSheetURI(), uri);
+            SerializeURI(sheet->GetSheetURI(), uri);
             Unused << SendLoadAndRegisterSheet(uri, nsIStyleSheetService::AUTHOR_SHEET);
         }
     }
@@ -3268,7 +3346,15 @@ ContentParent::Observe(nsISupports* aSubject,
     // gets initiated in chrome process.
     else if (aData && (*aData == '1') &&
              !strcmp(aTopic, "a11y-init-or-shutdown")) {
+#if !defined(XP_WIN)
         Unused << SendActivateA11y();
+#else
+        // On Windows we currently only enable a11y in the content process
+        // for testing purposes.
+        if (Preferences::GetBool(kForceEnableE10sPref, false)) {
+            Unused << SendActivateA11y();
+        }
+#endif
     }
 #endif
     else if (!strcmp(aTopic, "app-theme-changed")) {
@@ -3277,15 +3363,10 @@ ContentParent::Observe(nsISupports* aSubject,
 #ifdef MOZ_ENABLE_PROFILER_SPS
     else if (!strcmp(aTopic, "profiler-started")) {
         nsCOMPtr<nsIProfilerStartParams> params(do_QueryInterface(aSubject));
-        uint32_t entries;
-        double interval;
-        params->GetEntries(&entries);
-        params->GetInterval(&interval);
-        const nsTArray<nsCString>& features = params->GetFeatures();
-        const nsTArray<nsCString>& threadFilterNames = params->GetThreadFilterNames();
-        Unused << SendStartProfiler(entries, interval, features, threadFilterNames);
+        StartProfiler(params);
     }
     else if (!strcmp(aTopic, "profiler-stopped")) {
+        mGatherer = nullptr;
         Unused << SendStopProfiler();
     }
     else if (!strcmp(aTopic, "profiler-paused")) {
@@ -3295,9 +3376,10 @@ ContentParent::Observe(nsISupports* aSubject,
         Unused << SendPauseProfiler(false);
     }
     else if (!strcmp(aTopic, "profiler-subprocess-gather")) {
-        mGatherer = static_cast<ProfileGatherer*>(aSubject);
-        mGatherer->WillGatherOOPProfile();
-        Unused << SendGatherProfile();
+        if (mGatherer) {
+            mGatherer->WillGatherOOPProfile();
+            Unused << SendGatherProfile();
+        }
     }
     else if (!strcmp(aTopic, "profiler-subprocess")) {
         nsCOMPtr<nsIProfileSaveEvent> pse = do_QueryInterface(aSubject);
@@ -3515,6 +3597,18 @@ bool
 ContentParent::DeallocPBlobParent(PBlobParent* aActor)
 {
     return nsIContentParent::DeallocPBlobParent(aActor);
+}
+
+bool
+ContentParent::RecvPBlobConstructor(PBlobParent* aActor,
+                                    const BlobConstructorParams& aParams)
+{
+  const ParentBlobConstructorParams& params = aParams.get_ParentBlobConstructorParams();
+  if (params.blobParams().type() == AnyBlobConstructorParams::TKnownBlobConstructorParams) {
+    return aActor->SendCreatedFromKnownBlob();
+  }
+
+  return true;
 }
 
 mozilla::PRemoteSpellcheckEngineParent *
@@ -3898,6 +3992,21 @@ ContentParent::DeallocPExternalHelperAppParent(PExternalHelperAppParent* aServic
     return true;
 }
 
+PHandlerServiceParent*
+ContentParent::AllocPHandlerServiceParent()
+{
+    HandlerServiceParent* actor = new HandlerServiceParent();
+    actor->AddRef();
+    return actor;
+}
+
+bool
+ContentParent::DeallocPHandlerServiceParent(PHandlerServiceParent* aHandlerServiceParent)
+{
+    static_cast<HandlerServiceParent*>(aHandlerServiceParent)->Release();
+    return true;
+}
+
 PCellBroadcastParent*
 ContentParent::AllocPCellBroadcastParent()
 {
@@ -4274,7 +4383,8 @@ ContentParent::RecvAccumulateMixedContentHSTS(const URIParams& aURI, const bool&
 }
 
 bool
-ContentParent::RecvLoadURIExternal(const URIParams& uri)
+ContentParent::RecvLoadURIExternal(const URIParams& uri,
+                                   PBrowserParent* windowContext)
 {
     nsCOMPtr<nsIExternalProtocolService> extProtService(do_GetService(NS_EXTERNALPROTOCOLSERVICE_CONTRACTID));
     if (!extProtService) {
@@ -4284,7 +4394,10 @@ ContentParent::RecvLoadURIExternal(const URIParams& uri)
     if (!ourURI) {
         return false;
     }
-    extProtService->LoadURI(ourURI, nullptr);
+
+    RefPtr<RemoteWindowContext> context =
+        new RemoteWindowContext(static_cast<TabParent*>(windowContext));
+    extProtService->LoadURI(ourURI, context);
     return true;
 }
 
@@ -4800,6 +4913,7 @@ ContentParent::RecvNotifyKeywordSearchLoading(const nsString &aProvider,
 bool
 ContentParent::RecvCopyFavicon(const URIParams& aOldURI,
                                const URIParams& aNewURI,
+                               const IPC::Principal& aLoadingPrincipal,
                                const bool& aInPrivateBrowsing)
 {
     nsCOMPtr<nsIURI> oldURI = DeserializeURI(aOldURI);
@@ -4811,7 +4925,7 @@ ContentParent::RecvCopyFavicon(const URIParams& aOldURI,
         return true;
     }
 
-    nsDocShell::CopyFavicon(oldURI, newURI, aInPrivateBrowsing);
+    nsDocShell::CopyFavicon(oldURI, newURI, aLoadingPrincipal, aInPrivateBrowsing);
     return true;
 }
 
@@ -4980,64 +5094,6 @@ bool
 ContentParent::DeallocPFileDescriptorSetParent(PFileDescriptorSetParent* aActor)
 {
     delete static_cast<FileDescriptorSetParent*>(aActor);
-    return true;
-}
-
-bool
-ContentParent::RecvGetFileReferences(const PersistenceType& aPersistenceType,
-                                     const nsCString& aOrigin,
-                                     const nsString& aDatabaseName,
-                                     const int64_t& aFileId,
-                                     int32_t* aRefCnt,
-                                     int32_t* aDBRefCnt,
-                                     int32_t* aSliceRefCnt,
-                                     bool* aResult)
-{
-    MOZ_ASSERT(aRefCnt);
-    MOZ_ASSERT(aDBRefCnt);
-    MOZ_ASSERT(aSliceRefCnt);
-    MOZ_ASSERT(aResult);
-
-    if (NS_WARN_IF(aPersistenceType != quota::PERSISTENCE_TYPE_PERSISTENT &&
-                   aPersistenceType != quota::PERSISTENCE_TYPE_TEMPORARY &&
-                   aPersistenceType != quota::PERSISTENCE_TYPE_DEFAULT)) {
-        return false;
-    }
-
-    if (NS_WARN_IF(aOrigin.IsEmpty())) {
-        return false;
-    }
-
-    if (NS_WARN_IF(aDatabaseName.IsEmpty())) {
-        return false;
-    }
-
-    if (NS_WARN_IF(aFileId < 1)) {
-        return false;
-    }
-
-    RefPtr<IndexedDatabaseManager> mgr = IndexedDatabaseManager::Get();
-    if (NS_WARN_IF(!mgr)) {
-        return false;
-    }
-
-    if (NS_WARN_IF(!mgr->IsMainProcess())) {
-        return false;
-    }
-
-    nsresult rv =
-        mgr->BlockAndGetFileReferences(aPersistenceType,
-                                       aOrigin,
-                                       aDatabaseName,
-                                       aFileId,
-                                       aRefCnt,
-                                       aDBRefCnt,
-                                       aSliceRefCnt,
-                                       aResult);
-    if (NS_WARN_IF(NS_FAILED(rv))) {
-      return false;
-    }
-
     return true;
 }
 
@@ -5353,34 +5409,6 @@ ContentParent::DeallocPWebBrowserPersistDocumentParent(PWebBrowserPersistDocumen
   return true;
 }
 
-static already_AddRefed<nsPIDOMWindow>
-FindMostRecentOpenWindow()
-{
-    nsCOMPtr<nsIWindowMediator> windowMediator =
-        do_GetService(NS_WINDOWMEDIATOR_CONTRACTID);
-    nsCOMPtr<nsISimpleEnumerator> windowEnumerator;
-    windowMediator->GetEnumerator(MOZ_UTF16("navigator:browser"),
-                                  getter_AddRefs(windowEnumerator));
-
-    nsCOMPtr<nsPIDOMWindow> latest;
-
-    bool hasMore = false;
-    MOZ_ALWAYS_TRUE(NS_SUCCEEDED(windowEnumerator->HasMoreElements(&hasMore)));
-    while (hasMore) {
-        nsCOMPtr<nsISupports> item;
-        MOZ_ALWAYS_TRUE(NS_SUCCEEDED(windowEnumerator->GetNext(getter_AddRefs(item))));
-        nsCOMPtr<nsPIDOMWindow> window = do_QueryInterface(item);
-
-        if (window && !window->Closed()) {
-            latest = window;
-        }
-
-        MOZ_ALWAYS_TRUE(NS_SUCCEEDED(windowEnumerator->HasMoreElements(&hasMore)));
-    }
-
-    return latest.forget();
-}
-
 bool
 ContentParent::RecvCreateWindow(PBrowserParent* aThisTab,
                                 PBrowserParent* aNewTab,
@@ -5454,7 +5482,7 @@ ContentParent::RecvCreateWindow(PBrowserParent* aThisTab,
     // If we haven't found a chrome window to open in, just use the most recently
     // opened one.
     if (!parent) {
-        parent = FindMostRecentOpenWindow();
+        parent = nsContentUtils::GetMostRecentNonPBWindow();
         if (NS_WARN_IF(!parent)) {
             *aResult = NS_ERROR_FAILURE;
             return true;
@@ -5679,7 +5707,6 @@ ContentParent::RecvProfile(const nsCString& aProfile)
     }
     mProfile = aProfile;
     mGatherer->GatheredOOPProfile();
-    mGatherer = nullptr;
 #endif
     return true;
 }
@@ -5750,6 +5777,34 @@ ContentParent::RecvGetAndroidSystemInfo(AndroidSystemInfo* aInfo)
 #else
   MOZ_CRASH("wrong platform!");
   return false;
+#endif
+}
+
+void
+ContentParent::StartProfiler(nsIProfilerStartParams* aParams)
+{
+#ifdef MOZ_ENABLE_PROFILER_SPS
+    if (NS_WARN_IF(!aParams)) {
+        return;
+    }
+
+    ProfilerInitParams ipcParams;
+
+    ipcParams.enabled() = true;
+    aParams->GetEntries(&ipcParams.entries());
+    aParams->GetInterval(&ipcParams.interval());
+    ipcParams.features() = aParams->GetFeatures();
+    ipcParams.threadFilters() = aParams->GetThreadFilterNames();
+
+    Unused << SendStartProfiler(ipcParams);
+
+    nsCOMPtr<nsIProfiler> profiler(do_GetService("@mozilla.org/tools/profiler;1"));
+    if (NS_WARN_IF(!profiler)) {
+        return;
+    }
+    nsCOMPtr<nsISupports> gatherer;
+    profiler->GetProfileGatherer(getter_AddRefs(gatherer));
+    mGatherer = static_cast<ProfileGatherer*>(gatherer.get());
 #endif
 }
 

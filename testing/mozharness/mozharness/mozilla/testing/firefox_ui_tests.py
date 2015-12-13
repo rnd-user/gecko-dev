@@ -14,15 +14,24 @@ import os
 import sys
 import urlparse
 
-from mozharness.base.python import (
-    PreScriptAction,
-)
+from mozharness.base.log import FATAL
+from mozharness.base.python import PostScriptRun, PreScriptAction
+from mozharness.mozilla.structuredlog import StructuredOutputParser
 from mozharness.mozilla.testing.testbase import (
     TestingMixin,
     testing_config_options,
 )
 from mozharness.mozilla.vcstools import VCSToolsScript
 
+# Command line arguments for firefox ui tests
+firefox_ui_tests_harness_config_options = [
+    [["--e10s"], {
+        'dest': 'e10s',
+        'action': 'store_true',
+        'default': False,
+        'help': 'Enable multi-process (e10s) mode when running tests.',
+    }],
+]
 
 # General command line arguments for Firefox ui tests
 firefox_ui_tests_config_options = [
@@ -45,7 +54,8 @@ firefox_ui_tests_config_options = [
         'help': 'absolute path to directory containing breakpad '
                 'symbols, or the url of a zip file containing symbols.',
     }],
-] + copy.deepcopy(testing_config_options)
+] + firefox_ui_tests_harness_config_options \
+    + copy.deepcopy(testing_config_options)
 
 # Command line arguments for update tests
 firefox_ui_update_harness_config_options = [
@@ -97,10 +107,12 @@ class FirefoxUITests(TestingMixin, VCSToolsScript):
         config_options = config_options or firefox_ui_tests_config_options
         actions = [
             'clobber',
-            'checkout',
+            'download-and-extract',
+            'checkout',  # keep until firefox-ui-tests are located in tree
             'create-virtualenv',
-            'query_minidump_stackwalk',
+            'install',
             'run-tests',
+            'uninstall',
         ]
 
         super(FirefoxUITests, self).__init__(
@@ -108,6 +120,8 @@ class FirefoxUITests(TestingMixin, VCSToolsScript):
             all_actions=all_actions or actions,
             default_actions=default_actions or actions,
             *args, **kwargs)
+
+        self.reports = {'html': 'report.html', 'xunit': 'report.xml'}
 
         self.firefox_ui_repo = self.config['firefox_ui_repo']
         self.firefox_ui_branch = self.config.get('firefox_ui_branch')
@@ -120,9 +134,6 @@ class FirefoxUITests(TestingMixin, VCSToolsScript):
         # As long as we don't run on buildbot the installers are not handled by TestingMixin
         self.installer_url = self.config.get('installer_url')
         self.installer_path = self.config.get('installer_path')
-
-        if self.installer_path:
-            self.installer_path = os.path.abspath(self.installer_path)
 
     @PreScriptAction('create-virtualenv')
     def _pre_create_virtualenv(self, action):
@@ -158,8 +169,39 @@ class FirefoxUITests(TestingMixin, VCSToolsScript):
             repo=self.firefox_ui_repo,
             dest=dirs['fx_ui_dir'],
             branch=self.firefox_ui_branch,
-            vcs='gittool'
+            vcs='gittool',
+            env=self.query_env(),
         )
+
+    def clobber(self):
+        """Delete the working directory"""
+        super(FirefoxUITests, self).clobber()
+
+        # Also ensure to delete the reports directory to get rid of old files
+        dirs = self.query_abs_dirs()
+        self.rmtree(dirs['abs_reports_dir'], error_level=FATAL)
+
+    def copy_reports_to_upload_dir(self):
+        self.info("Copying reports to upload dir...")
+
+        dirs = self.query_abs_dirs()
+        for report in self.reports:
+            self.copy_to_upload_dir(os.path.join(dirs['abs_reports_dir'], self.reports[report]),
+                                    dest=os.path.join('reports', self.reports[report]),
+                                    short_desc='%s log' % self.reports[report],
+                                    long_desc='%s log' % self.reports[report],
+                                    max_backups=self.config.get("log_max_rotate", 0))
+
+    def download_and_extract(self):
+        """Overriding method from TestingMixin until firefox-ui-tests are in tree.
+
+        Right now we only care about the installer and symbolds.
+
+        """
+        self._download_installer()
+
+        if self.config.get('download_symbols'):
+            self._download_and_extract_symbols()
 
     def query_abs_dirs(self):
         if self.abs_dirs:
@@ -167,18 +209,33 @@ class FirefoxUITests(TestingMixin, VCSToolsScript):
 
         abs_dirs = VCSToolsScript.query_abs_dirs(self)
         abs_dirs.update({
+            'abs_reports_dir': os.path.join(abs_dirs['base_work_dir'], 'reports'),
             'fx_ui_dir': os.path.join(abs_dirs['abs_work_dir'], 'firefox_ui_tests'),
         })
         self.abs_dirs = abs_dirs
 
         return self.abs_dirs
 
-    def query_extra_cmd_args(self):
+    def query_harness_args(self, extra_harness_config_options=None):
         """Collects specific update test related command line arguments.
 
         Sub classes should override this method for their own specific arguments.
         """
-        return []
+        extra_harness_config_options = extra_harness_config_options or []
+        config_options = firefox_ui_tests_harness_config_options + extra_harness_config_options
+
+        args = []
+        for option in config_options:
+            dest = option[1]['dest']
+            name = self.config.get(dest)
+
+            if name:
+                if type(name) is bool:
+                    args.append(option[0][0])
+                else:
+                    args.extend([option[0][0], self.config[dest]])
+
+        return args
 
     def query_minidump_stackwalk(self):
         """We don't have an extracted test package available to get the manifest file.
@@ -203,59 +260,59 @@ class FirefoxUITests(TestingMixin, VCSToolsScript):
             except Exception as e:
                 self.fatal('Download of tooltool manifest file failed: %s' % e.message)
 
-        super(FirefoxUITests, self).query_minidump_stackwalk(manifest=manifest_path)
+        return super(FirefoxUITests, self).query_minidump_stackwalk(manifest=manifest_path)
 
-    def run_test(self, installer_path, env=None, cleanup=True, marionette_port=2828):
+    @PostScriptRun
+    def _upload_reports_post_run(self):
+        if self.config.get("copy_reports_post_run", True):
+            self.copy_reports_to_upload_dir()
+
+    def run_test(self, binary_path, env=None, marionette_port=2828):
         """All required steps for running the tests against an installer."""
         dirs = self.query_abs_dirs()
-
-        gecko_log = os.path.join(dirs['abs_log_dir'], 'gecko.log')
 
         cmd = [
             self.query_python_path(),
             os.path.join(dirs['fx_ui_dir'], 'firefox_ui_harness', self.cli_script),
-            '--installer', installer_path,
-            # Log to stdout until tests are stable.
-            # '--gecko-log', gecko_log,
-            '--gecko-log=-',
+            '--binary', binary_path,
             '--address', 'localhost:{}'.format(marionette_port),
+
             # Use the work dir to get temporary data stored
             '--workspace', dirs['abs_work_dir'],
+
+            # logging options
+            '--gecko-log=-',  # output from the gecko process redirected to stdout
+            '--log-raw=-',  # structured log for output parser redirected to stdout
+
+            # additional reports helpful for Jenkins and inpection via Treeherder
+            '--log-html', os.path.join(dirs["abs_reports_dir"], self.reports['html']),
+            '--log-xunit', os.path.join(dirs["abs_reports_dir"], self.reports['xunit']),
         ]
 
         # Collect all pass-through harness options to the script
-        cmd.extend(self.query_extra_cmd_args())
+        cmd.extend(self.query_harness_args())
 
         # Set further environment settings
         env = env or self.query_env()
-        if self.minidump_stackwalk_path:
+
+        if self.symbols_url:
+            cmd.extend(['--symbols-path', self.symbols_url])
+
+        if self.query_minidump_stackwalk():
             env['MINIDUMP_STACKWALK'] = self.minidump_stackwalk_path
 
-            if self.query_symbols_url():
-                cmd += ['--symbols-path', self.symbols_url]
+        parser = StructuredOutputParser(config=self.config,
+                                        log_obj=self.log_obj,
+                                        strict=False)
 
-        return_code = self.run_command(cmd, cwd=dirs['abs_work_dir'],
-                                       output_timeout=300, env=env)
+        return_code = self.run_command(cmd,
+                                       cwd=dirs['abs_work_dir'],
+                                       output_timeout=300,
+                                       output_parser=parser,
+                                       env=env)
 
-        # Return more output if we fail
-        if return_code:
-            if os.path.exists(gecko_log):
-                contents = self.read_from_file(gecko_log, verbose=False)
-                self.warning('== Dumping gecko output ==')
-                self.warning(contents)
-                self.warning('== End of gecko output ==')
-            else:
-                # We're outputting to stdout with --gecko-log=- so there is not log to
-                # complaing about. Remove the commented line below when changing
-                # this behaviour.
-                # self.warning('No gecko.log was found: %s' % gecko_log)
-                pass
-
-        if cleanup:
-            for filepath in (installer_path, gecko_log):
-                if os.path.exists(filepath):
-                    self.debug('Removing {}'.format(filepath))
-                    os.remove(filepath)
+        tbpl_status, log_level = parser.evaluate_parser(return_code)
+        self.buildbot_status(tbpl_status, level=log_level)
 
         return return_code
 
@@ -266,18 +323,10 @@ class FirefoxUITests(TestingMixin, VCSToolsScript):
             sys.exit(1)
 
     def run_tests(self):
-        dirs = self.query_abs_dirs()
-
-        if self.installer_url:
-            self.installer_path = self.download_file(
-                self.installer_url,
-                parent_dir=dirs['abs_work_dir']
-            )
-
+        """Run all the tests"""
         return self.run_test(
-            installer_path=self.installer_path,
+            binary_path=self.binary_path,
             env=self.query_env(),
-            cleanup=False,
         )
 
 
@@ -291,18 +340,7 @@ class FirefoxUIUpdateTests(FirefoxUITests):
         FirefoxUITests.__init__(self, config_options=config_options,
                                 *args, **kwargs)
 
-    def query_extra_cmd_args(self):
+    def query_harness_args(self):
         """Collects specific update test related command line arguments."""
-        args = []
-
-        for option in firefox_ui_update_harness_config_options:
-            dest = option[1]['dest']
-            name = self.config.get(dest)
-
-            if name:
-                if type(name) is bool:
-                    args.append(option[0][0])
-                else:
-                    args.extend([option[0][0], self.config[dest]])
-
-        return args
+        return FirefoxUITests.query_harness_args(self,
+                                                 firefox_ui_update_harness_config_options)

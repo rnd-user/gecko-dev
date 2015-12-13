@@ -12,7 +12,7 @@
 #include <stdint.h>
 #include <inttypes.h>  // For PRId64
 
-extern PRLogModuleInfo* GetPDMLog();
+extern mozilla::LogModule* GetPDMLog();
 #define OPUS_DEBUG(arg, ...) MOZ_LOG(GetPDMLog(), mozilla::LogLevel::Debug, \
     ("OpusDataDecoder(%p)::%s: " arg, this, __func__, ##__VA_ARGS__))
 
@@ -304,7 +304,8 @@ OpusDataDecoder::Flush()
 bool
 OpusDataDecoder::IsOpus(const nsACString& aMimeType)
 {
-  return aMimeType.EqualsLiteral("audio/ogg; codecs=opus");
+  return aMimeType.EqualsLiteral("audio/webm; codecs=opus") ||
+         aMimeType.EqualsLiteral("audio/ogg; codecs=opus");
 }
 
 } // namespace mozilla

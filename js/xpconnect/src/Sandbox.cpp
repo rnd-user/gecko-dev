@@ -40,6 +40,7 @@
 #ifdef MOZ_WEBRTC
 #include "mozilla/dom/RTCIdentityProviderRegistrar.h"
 #endif
+#include "mozilla/dom/FileReaderBinding.h"
 #include "mozilla/dom/ScriptSettings.h"
 #include "mozilla/dom/TextDecoderBinding.h"
 #include "mozilla/dom/TextEncoderBinding.h"
@@ -289,9 +290,8 @@ SandboxFetch(JSContext* cx, JS::HandleObject scope, const CallArgs& args)
     ErrorResult rv;
     RefPtr<dom::Promise> response =
         FetchRequest(global, Constify(request), Constify(options), rv);
-    rv.WouldReportJSException();
-    if (rv.Failed()) {
-        return ThrowMethodFailed(cx, rv);
+    if (rv.MaybeSetPendingException(cx)) {
+        return false;
     }
     if (!GetOrCreateDOMReflector(cx, response, args.rval())) {
         return false;
@@ -893,6 +893,8 @@ xpc::GlobalProperties::Parse(JSContext* cx, JS::HandleObject obj)
             fetch = true;
         } else if (!strcmp(name.ptr(), "caches")) {
             caches = true;
+        } else if (!strcmp(name.ptr(), "FileReader")) {
+            fileReader = true;
         } else {
             JS_ReportError(cx, "Unknown property name: %s", name.ptr());
             return false;
@@ -959,6 +961,9 @@ xpc::GlobalProperties::Define(JSContext* cx, JS::HandleObject obj)
         return false;
 
     if (caches && !dom::cache::CacheStorage::DefineCaches(cx, obj))
+        return false;
+
+    if (fileReader && !dom::FileReaderBinding::GetConstructorObject(cx, obj))
         return false;
 
     return true;
@@ -1186,7 +1191,7 @@ ParsePrincipal(JSContext* cx, HandleString codebase, nsIPrincipal** principal)
     // We could allow passing in the app-id and browser-element info to the
     // sandbox constructor. But creating a sandbox based on a string is a
     // deprecated API so no need to add features to it.
-    OriginAttributes attrs;
+    PrincipalOriginAttributes attrs;
     nsCOMPtr<nsIPrincipal> prin =
         BasePrincipal::CreateCodebasePrincipal(uri, attrs);
     prin.forget(principal);

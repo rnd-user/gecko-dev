@@ -10,6 +10,7 @@
 #include "nsWrapperCache.h"
 #include "nsCycleCollectionParticipant.h"
 #include "mozilla/Attributes.h"
+#include "mozilla/LinkedList.h"
 #include "mozilla/TimeStamp.h" // for TimeStamp, TimeDuration
 #include "mozilla/dom/AnimationBinding.h" // for AnimationPlayState
 #include "mozilla/dom/AnimationTimeline.h" // for AnimationTimeline
@@ -48,6 +49,7 @@ class CSSTransition;
 
 class Animation
   : public DOMEventTargetHelper
+  , public LinkedListElement<Animation>
 {
 protected:
   virtual ~Animation() {}
@@ -230,6 +232,15 @@ public:
    */
   Nullable<TimeDuration> GetCurrentOrPendingStartTime() const;
 
+  /**
+   * Converts a time in the timescale of this Animation's currentTime, to a
+   * TimeStamp. Returns a null TimeStamp if the conversion cannot be performed
+   * because of the current state of this Animation (e.g. it has no timeline, a
+   * zero playbackRate, an unresolved start time etc.) or the value of the time
+   * passed-in (e.g. an infinite time).
+   */
+  TimeStamp AnimationTimeToTimeStamp(const StickyTimeDuration& aTime) const;
+
   bool IsPausedOrPausing() const
   {
     return PlayState() == AnimationPlayState::Paused ||
@@ -352,7 +363,6 @@ protected:
 
   bool IsPossiblyOrphanedPendingAnimation() const;
   StickyTimeDuration EffectEnd() const;
-  TimeStamp AnimationTimeToTimeStamp(const StickyTimeDuration& aTime) const;
 
   nsIDocument* GetRenderedDocument() const;
   nsPresContext* GetPresContext() const;

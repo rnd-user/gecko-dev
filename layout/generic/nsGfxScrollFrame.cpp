@@ -1096,7 +1096,7 @@ ScrollFrameHelper::HandleScrollbarStyleSwitching()
   }
 }
 
-#if defined(MOZ_B2G) || (defined(MOZ_WIDGET_ANDROID) && !defined(MOZ_ANDROID_APZ))
+#if defined(MOZ_B2G) || defined(MOZ_WIDGET_ANDROID)
 static bool IsFocused(nsIContent* aContent)
 {
   // Some content elements, like the GetContent() of a scroll frame
@@ -1138,7 +1138,7 @@ ScrollFrameHelper::WantAsyncScroll() const
   bool isHScrollable = !!(directions & nsIScrollableFrame::HORIZONTAL) &&
                        (styles.mHorizontal != NS_STYLE_OVERFLOW_HIDDEN);
 
-#if defined(MOZ_B2G) || (defined(MOZ_WIDGET_ANDROID) && !defined(MOZ_ANDROID_APZ))
+#if defined(MOZ_B2G) || defined(MOZ_WIDGET_ANDROID)
   // Mobile platforms need focus to scroll.
   bool canScrollWithoutScrollbars = IsFocused(mOuter->GetContent());
 #else
@@ -1825,7 +1825,6 @@ ScrollFrameHelper::ScrollFrameHelper(nsContainerFrame* aOuter,
   , mScrollPosAtLastPaint(0, 0)
   , mRestorePos(-1, -1)
   , mLastPos(-1, -1)
-  , mResolution(1.0)
   , mScrollPosForLayerPixelAlignment(-1, -1)
   , mLastUpdateImagesPos(-1, -1)
   , mNeverHasVerticalScrollbar(false)
@@ -1849,9 +1848,7 @@ ScrollFrameHelper::ScrollFrameHelper(nsContainerFrame* aOuter,
   , mWillBuildScrollableLayer(false)
   , mIsScrollableLayerInRootContainer(false)
   , mHasBeenScrolled(false)
-  , mIsResolutionSet(false)
   , mIgnoreMomentumScroll(false)
-  , mScaleToResolution(false)
   , mTransformingByAPZ(false)
   , mZoomableByAPZ(false)
   , mVelocityQueue(aOuter->PresContext())
@@ -2124,10 +2121,30 @@ ScrollFrameHelper::ScrollToWithOrigin(nsPoint aScrollPosition,
         }
 
         if (nsLayoutUtils::AsyncPanZoomEnabled(mOuter)) {
+          if (mApzSmoothScrollDestination == mDestination &&
+              mScrollGeneration == sScrollGenerationCounter) {
+            // If we already sent APZ a smooth-scroll request to this
+            // destination with this generation (i.e. it was the last request
+            // we sent), then don't send another one because it is redundant.
+            // This is to avoid a scenario where pages do repeated scrollBy
+            // calls, incrementing the generation counter, and blocking APZ from
+            // syncing the scroll offset back to the main thread.
+            // Note that if we get two smooth-scroll requests to the same
+            // destination with some other scroll in between, mDestination will
+            // get reset and so we shouldn't have the problem where this check
+            // discards a legitimate smooth-scroll.
+            // Note: if there are two separate scrollframes both getting smooth
+            // scrolled at the same time, sScrollGenerationCounter can get
+            // incremented and this early-exit won't get taken. Bug 1231177 is
+            // on file for this.
+            return;
+          }
+
           // The animation will be handled in the compositor, pass the
           // information needed to start the animation and skip the main-thread
           // animation for this scroll.
           mLastSmoothScrollOrigin = aOrigin;
+          mApzSmoothScrollDestination = mDestination;
           mScrollGeneration = ++sScrollGenerationCounter;
 
           if (!nsLayoutUtils::GetDisplayPort(mOuter->GetContent())) {
@@ -3408,29 +3425,6 @@ ScrollFrameHelper::GetScrollPositionClampingScrollPortSize() const
   return mScrollPort.Size();
 }
 
-float
-ScrollFrameHelper::GetResolution() const
-{
-  return mResolution;
-}
-
-void
-ScrollFrameHelper::SetResolution(float aResolution)
-{
-  mResolution = aResolution;
-  mIsResolutionSet = true;
-  mScaleToResolution = false;
-}
-
-void
-ScrollFrameHelper::SetResolutionAndScaleTo(float aResolution)
-{
-  MOZ_ASSERT(mIsRoot);  // This API should only be called on root scroll frames.
-  mResolution = aResolution;
-  mIsResolutionSet = true;
-  mScaleToResolution = true;
-}
-
 static void
 AdjustForWholeDelta(int32_t aDelta, nscoord* aCoord)
 {
@@ -3706,8 +3700,11 @@ GetScrollPortSizeExcludingHeadersAndFooters(nsIFrame* aViewportFrame,
   for (nsFrameList::Enumerator iterator(fixedFrames); !iterator.AtEnd();
        iterator.Next()) {
     nsIFrame* f = iterator.get();
-    nsRect r = f->GetRect().Intersect(aScrollPort);
-    if (r.x == 0 && r.width == aScrollPort.width &&
+    nsRect r = f->GetRectRelativeToSelf();
+    r = nsLayoutUtils::TransformFrameRectToAncestor(f, r, aViewportFrame);
+    r = r.Intersect(aScrollPort);
+    if ((r.width >= aScrollPort.width / 2 ||
+         r.width >= NSIntPixelsToAppUnits(800, AppUnitsPerCSSPixel())) &&
         r.height <= aScrollPort.height/3) {
       list.AppendElement(TopAndBottom(r.y, r.YMost()));
     }
@@ -4786,7 +4783,7 @@ ScrollFrameHelper::ReflowFinished()
     mMayHaveDirtyFixedChildren = false;
     nsIFrame* parentFrame = mOuter->GetParent();
     for (nsIFrame* fixedChild =
-           parentFrame->GetFirstChild(nsIFrame::kFixedList);
+           parentFrame->GetChildList(nsIFrame::kFixedList).FirstChild();
          fixedChild; fixedChild = fixedChild->GetNextSibling()) {
       // force a reflow of the fixed child
       presContext->PresShell()->
@@ -4951,7 +4948,7 @@ ScrollFrameHelper::AdjustScrollbarRectForResizer(
   else {
     nsPoint offset;
     nsIWidget* widget = aFrame->GetNearestWidget(offset);
-    nsIntRect widgetRect;
+    LayoutDeviceIntRect widgetRect;
     if (!widget || !widget->ShowsResizeIndicator(&widgetRect))
       return;
 
@@ -5382,8 +5379,12 @@ ScrollFrameHelper::SaveState() const
     pt = mRestorePos;
   }
   state->SetScrollState(pt);
-  state->SetResolution(mResolution);
-  state->SetScaleToResolution(mScaleToResolution);
+  if (mIsRoot) {
+    // Only save resolution properties for root scroll frames
+    nsIPresShell* shell = mOuter->PresContext()->PresShell();
+    state->SetResolution(shell->GetResolution());
+    state->SetScaleToResolution(shell->ScaleToResolution());
+  }
   return state;
 }
 
@@ -5393,19 +5394,17 @@ ScrollFrameHelper::RestoreState(nsPresState* aState)
   mRestorePos = aState->GetScrollState();
   mDidHistoryRestore = true;
   mLastPos = mScrolledFrame ? GetLogicalScrollPosition() : nsPoint(0,0);
-  mResolution = aState->GetResolution();
-  mIsResolutionSet = true;
-  mScaleToResolution = aState->GetScaleToResolution();
 
-  // Scaling-to-resolution should only be used on root scroll frames.
-  MOZ_ASSERT(mIsRoot || !mScaleToResolution);
+  // Resolution properties should only exist on root scroll frames.
+  MOZ_ASSERT(mIsRoot || (!aState->GetScaleToResolution() &&
+                         aState->GetResolution() == 1.0));
 
   if (mIsRoot) {
     nsIPresShell* presShell = mOuter->PresContext()->PresShell();
-    if (mScaleToResolution) {
-      presShell->SetResolutionAndScaleTo(mResolution);
+    if (aState->GetScaleToResolution()) {
+      presShell->SetResolutionAndScaleTo(aState->GetResolution());
     } else {
-      presShell->SetResolution(mResolution);
+      presShell->SetResolution(aState->GetResolution());
     }
   }
 }

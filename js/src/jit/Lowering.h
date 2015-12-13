@@ -100,9 +100,9 @@ class LIRGenerator : public LIRGeneratorSpecific
     void visitSetArgumentsObjectArg(MSetArgumentsObjectArg* ins);
     void visitReturnFromCtor(MReturnFromCtor* ins);
     void visitComputeThis(MComputeThis* ins);
-    void visitLoadArrowThis(MLoadArrowThis* ins);
     void visitCall(MCall* call);
     void visitApplyArgs(MApplyArgs* apply);
+    void visitApplyArray(MApplyArray* apply);
     void visitArraySplice(MArraySplice* splice);
     void visitBail(MBail* bail);
     void visitUnreachable(MUnreachable* unreachable);
@@ -177,6 +177,7 @@ class LIRGenerator : public LIRGeneratorSpecific
     void visitMaybeToDoubleElement(MMaybeToDoubleElement* ins);
     void visitMaybeCopyElementsForWrite(MMaybeCopyElementsForWrite* ins);
     void visitLoadSlot(MLoadSlot* ins);
+    void visitLoadFixedSlotAndUnbox(MLoadFixedSlotAndUnbox* ins);
     void visitFunctionEnvironment(MFunctionEnvironment* ins);
     void visitInterruptCheck(MInterruptCheck* ins);
     void visitAsmJSInterruptCheck(MAsmJSInterruptCheck* ins);
@@ -229,6 +230,7 @@ class LIRGenerator : public LIRGeneratorSpecific
     void visitGetPropertyPolymorphic(MGetPropertyPolymorphic* ins);
     void visitSetPropertyPolymorphic(MSetPropertyPolymorphic* ins);
     void visitBindNameCache(MBindNameCache* ins);
+    void visitCallBindVar(MCallBindVar* ins);
     void visitGuardObjectIdentity(MGuardObjectIdentity* ins);
     void visitGuardClass(MGuardClass* ins);
     void visitGuardObject(MGuardObject* ins);
@@ -306,7 +308,9 @@ class LIRGenerator : public LIRGeneratorSpecific
     void visitNewTarget(MNewTarget* ins);
     void visitArrowNewTarget(MArrowNewTarget* ins);
     void visitAtomicIsLockFree(MAtomicIsLockFree* ins);
+    void visitGuardSharedTypedArray(MGuardSharedTypedArray* ins);
     void visitCheckReturn(MCheckReturn* ins);
+    void visitCheckObjCoercible(MCheckObjCoercible* ins);
 };
 
 } // namespace jit

@@ -4,14 +4,18 @@
 
 var {classes: Cc, interfaces: Ci, utils: Cu, results: Cr} = Components;
 
+Cu.import("resource://gre/modules/AppConstants.jsm");
+Cu.import("resource://gre/modules/Services.jsm");
+
 // Copied from nsILookAndFeel.h, see comments on eMetric_AlertNotificationOrigin
 const NS_ALERT_HORIZONTAL = 1;
 const NS_ALERT_LEFT = 2;
 const NS_ALERT_TOP = 4;
 
-const WINDOW_MARGIN = 10;
+const WINDOW_MARGIN = AppConstants.platform == "win" ? 0 : 10;
+const BODY_TEXT_LIMIT = 200;
+const WINDOW_SHADOW_SPREAD = AppConstants.platform == "win" ? 10 : 0;
 
-Cu.import("resource://gre/modules/Services.jsm");
 
 var gOrigin = 0; // Default value: alert from bottom right.
 var gReplacedWindow = null;
@@ -93,10 +97,34 @@ function prefillAlertInfo() {
     case 3:
       if (window.arguments[2]) {
         document.getElementById("alertBox").setAttribute("hasBodyText", true);
-        document.getElementById("alertTextLabel").textContent = window.arguments[2];
+        let bodyText = window.arguments[2];
+        let bodyTextLabel = document.getElementById("alertTextLabel");
+
+        if (bodyText.length > BODY_TEXT_LIMIT) {
+          bodyTextLabel.setAttribute("tooltiptext", bodyText);
+
+          let ellipsis = "\u2026";
+          try {
+            ellipsis = Services.prefs.getComplexValue("intl.ellipsis",
+                                                      Ci.nsIPrefLocalizedString).data;
+          } catch (e) { }
+
+          // Copied from nsContextMenu.js' formatSearchContextItem().
+          // If the JS character after our truncation point is a trail surrogate,
+          // include it in the truncated string to avoid splitting a surrogate pair.
+          let truncLength = BODY_TEXT_LIMIT;
+          let truncChar = bodyText[BODY_TEXT_LIMIT].charCodeAt(0);
+          if (truncChar >= 0xDC00 && truncChar <= 0xDFFF) {
+            truncLength++;
+          }
+
+          bodyText = bodyText.substring(0, truncLength) +
+                     ellipsis;
+        }
+        bodyTextLabel.textContent = bodyText;
       }
     case 2:
-      document.getElementById("alertTitleLabel").textContent = window.arguments[1];
+      document.getElementById("alertTitleLabel").setAttribute("value", window.arguments[1]);
     case 1:
       if (window.arguments[0]) {
         document.getElementById("alertBox").setAttribute("hasImage", true);
@@ -139,6 +167,10 @@ function onAlertLoad() {
     }, false);
     alertBox.setAttribute("animate", true);
   }
+
+  let alertSettings = document.getElementById("alertSettings");
+  alertSettings.addEventListener("focus", onAlertSettingsFocus);
+  alertSettings.addEventListener("click", onAlertSettingsClick);
 
   let ev = new CustomEvent("AlertActive", {bubbles: true, cancelable: true});
   document.documentElement.dispatchEvent(ev);
@@ -188,9 +220,9 @@ function moveWindowToEnd() {
     let alertWindow = windows.getNext();
     if (alertWindow != window) {
       if (gOrigin & NS_ALERT_TOP) {
-        y = Math.max(y, alertWindow.screenY + alertWindow.outerHeight);
+        y = Math.max(y, alertWindow.screenY + alertWindow.outerHeight - WINDOW_SHADOW_SPREAD);
       } else {
-        y = Math.min(y, alertWindow.screenY - window.outerHeight);
+        y = Math.min(y, alertWindow.screenY - window.outerHeight + WINDOW_SHADOW_SPREAD);
       }
     }
   }
@@ -205,7 +237,7 @@ function moveWindowToEnd() {
 function onAlertBeforeUnload() {
   if (!gIsReplaced) {
     // Move other alert windows to fill the gap left by closing alert.
-    let heightDelta = window.outerHeight + WINDOW_MARGIN;
+    let heightDelta = window.outerHeight + WINDOW_MARGIN - WINDOW_SHADOW_SPREAD;
     let windows = Services.wm.getEnumerator("alert:alert");
     while (windows.hasMoreElements()) {
       let alertWindow = windows.getNext();
@@ -247,12 +279,26 @@ function doNotDisturb() {
                          .getService(Ci.nsIAlertsService)
                          .QueryInterface(Ci.nsIAlertsDoNotDisturb);
   alertService.manualDoNotDisturb = true;
+  Services.telemetry.getHistogramById("WEB_NOTIFICATION_MENU")
+                    .add(0);
   onAlertClose();
 }
 
 function disableForOrigin() {
   gAlertListener.observe(null, "alertdisablecallback", gAlertCookie);
   onAlertClose();
+}
+
+function onAlertSettingsFocus(event) {
+  event.target.removeAttribute("focusedViaMouse");
+}
+
+function onAlertSettingsClick(event) {
+  // XXXjaws Hack used to remove the focus-ring only
+  // from mouse interaction, but focus-ring drawing
+  // should only be enabled when interacting via keyboard.
+  event.target.setAttribute("focusedViaMouse", true);
+  event.stopPropagation();
 }
 
 function openSettings() {

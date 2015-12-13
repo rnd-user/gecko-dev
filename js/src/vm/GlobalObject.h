@@ -30,6 +30,8 @@ class TypedObjectModuleObject;
 class StaticBlockObject;
 class ClonedBlockObject;
 
+class SimdTypeDescr;
+
 /*
  * Global object slots are reserved as follows:
  *
@@ -94,6 +96,7 @@ class GlobalObject : public NativeObject
 
         /* One-off properties stored after slots for built-ins. */
         LEXICAL_SCOPE,
+        ITERATOR_PROTO,
         ARRAY_ITERATOR_PROTO,
         STRING_ITERATOR_PROTO,
         LEGACY_GENERATOR_OBJECT_PROTO,
@@ -105,16 +108,14 @@ class GlobalObject : public NativeObject
         COLLATOR_PROTO,
         NUMBER_FORMAT_PROTO,
         DATE_TIME_FORMAT_PROTO,
+        MODULE_PROTO,
+        IMPORT_ENTRY_PROTO,
+        EXPORT_ENTRY_PROTO,
         REGEXP_STATICS,
         WARNED_ONCE_FLAGS,
         RUNTIME_CODEGEN_ENABLED,
         DEBUGGERS,
         INTRINSICS,
-        FLOAT32X4_TYPE_DESCR,
-        FLOAT64X2_TYPE_DESCR,
-        INT8X16_TYPE_DESCR,
-        INT16X8_TYPE_DESCR,
-        INT32X4_TYPE_DESCR,
         FOR_OF_PIC_CHAIN,
         MODULE_RESOLVE_HOOK,
         WINDOW_PROXY,
@@ -437,59 +438,23 @@ class GlobalObject : public NativeObject
         return getOrCreateObject(cx, APPLICATION_SLOTS + JSProto_TypedObject, initTypedObjectModule);
     }
 
-    void setFloat32x4TypeDescr(JSObject& obj) {
-        MOZ_ASSERT(getSlotRef(FLOAT32X4_TYPE_DESCR).isUndefined());
-        setSlot(FLOAT32X4_TYPE_DESCR, ObjectValue(obj));
+    JSObject* getOrCreateSimdGlobalObject(JSContext* cx) {
+        return getOrCreateObject(cx, APPLICATION_SLOTS + JSProto_SIMD, initSimdObject);
     }
 
-    JSObject& float32x4TypeDescr() {
-        MOZ_ASSERT(getSlotRef(FLOAT32X4_TYPE_DESCR).isObject());
-        return getSlotRef(FLOAT32X4_TYPE_DESCR).toObject();
-    }
-
-    void setFloat64x2TypeDescr(JSObject& obj) {
-        MOZ_ASSERT(getSlotRef(FLOAT64X2_TYPE_DESCR).isUndefined());
-        setSlot(FLOAT64X2_TYPE_DESCR, ObjectValue(obj));
-    }
-
-    JSObject& float64x2TypeDescr() {
-        MOZ_ASSERT(getSlotRef(FLOAT64X2_TYPE_DESCR).isObject());
-        return getSlotRef(FLOAT64X2_TYPE_DESCR).toObject();
-    }
-
-    void setInt8x16TypeDescr(JSObject& obj) {
-        MOZ_ASSERT(getSlotRef(INT8X16_TYPE_DESCR).isUndefined());
-        setSlot(INT8X16_TYPE_DESCR, ObjectValue(obj));
-    }
-
-    JSObject& int8x16TypeDescr() {
-        MOZ_ASSERT(getSlotRef(INT8X16_TYPE_DESCR).isObject());
-        return getSlotRef(INT8X16_TYPE_DESCR).toObject();
-    }
-
-    void setInt16x8TypeDescr(JSObject& obj) {
-        MOZ_ASSERT(getSlotRef(INT16X8_TYPE_DESCR).isUndefined());
-        setSlot(INT16X8_TYPE_DESCR, ObjectValue(obj));
-    }
-
-    JSObject& int16x8TypeDescr() {
-        MOZ_ASSERT(getSlotRef(INT16X8_TYPE_DESCR).isObject());
-        return getSlotRef(INT16X8_TYPE_DESCR).toObject();
-    }
-
-    void setInt32x4TypeDescr(JSObject& obj) {
-        MOZ_ASSERT(getSlotRef(INT32X4_TYPE_DESCR).isUndefined());
-        setSlot(INT32X4_TYPE_DESCR, ObjectValue(obj));
-    }
-
-    JSObject& int32x4TypeDescr() {
-        MOZ_ASSERT(getSlotRef(INT32X4_TYPE_DESCR).isObject());
-        return getSlotRef(INT32X4_TYPE_DESCR).toObject();
+    template<class /* SimdTypeDescriptor (cf SIMD.h) */ T>
+    SimdTypeDescr* getOrCreateSimdTypeDescr(JSContext* cx) {
+        RootedObject globalSimdObject(cx, cx->global()->getOrCreateSimdGlobalObject(cx));
+        if (!globalSimdObject)
+            return nullptr;
+        const Value& slot = globalSimdObject->as<NativeObject>().getReservedSlot(uint32_t(T::type));
+        MOZ_ASSERT(slot.isObject());
+        return &slot.toObject().as<SimdTypeDescr>();
     }
 
     TypedObjectModuleObject& getTypedObjectModule() const;
 
-    JSObject* getIteratorPrototype() {
+    JSObject* getLegacyIteratorPrototype() {
         return &getPrototype(JSProto_Iterator).toObject();
     }
 
@@ -503,6 +468,18 @@ class GlobalObject : public NativeObject
 
     JSObject* getOrCreateDateTimeFormatPrototype(JSContext* cx) {
         return getOrCreateObject(cx, DATE_TIME_FORMAT_PROTO, initDateTimeFormatProto);
+    }
+
+    JSObject* getModulePrototype() {
+        return &getSlot(MODULE_PROTO).toObject();
+    }
+
+    JSObject* getImportEntryPrototype() {
+        return &getSlot(IMPORT_ENTRY_PROTO).toObject();
+    }
+
+    JSObject* getExportEntryPrototype() {
+        return &getSlot(EXPORT_ENTRY_PROTO).toObject();
     }
 
     static JSFunction*
@@ -533,13 +510,9 @@ class GlobalObject : public NativeObject
     }
 
   public:
-    static NativeObject* getOrCreateIteratorPrototype(JSContext* cx,
-                                                      Handle<GlobalObject*> global)
+    static NativeObject* getOrCreateIteratorPrototype(JSContext* cx, Handle<GlobalObject*> global)
     {
-        if (!ensureConstructor(cx, global, JSProto_Iterator))
-            return nullptr;
-        size_t slot = APPLICATION_SLOTS + JSProto_LIMIT + JSProto_Iterator;
-        return &global->getSlot(slot).toObject().as<NativeObject>();
+        return MaybeNativeObject(global->getOrCreateObject(cx, ITERATOR_PROTO, initIteratorProto));
     }
 
     static NativeObject* getOrCreateArrayIteratorPrototype(JSContext* cx, Handle<GlobalObject*> global)
@@ -702,6 +675,7 @@ class GlobalObject : public NativeObject
     bool valueIsEval(Value val);
 
     // Implemented in jsiter.cpp.
+    static bool initIteratorProto(JSContext* cx, Handle<GlobalObject*> global);
     static bool initArrayIteratorProto(JSContext* cx, Handle<GlobalObject*> global);
     static bool initStringIteratorProto(JSContext* cx, Handle<GlobalObject*> global);
 
@@ -719,8 +693,16 @@ class GlobalObject : public NativeObject
     static bool initNumberFormatProto(JSContext* cx, Handle<GlobalObject*> global);
     static bool initDateTimeFormatProto(JSContext* cx, Handle<GlobalObject*> global);
 
+    // Implemented in builtin/ModuleObject.cpp
+    static bool initModuleProto(JSContext* cx, Handle<GlobalObject*> global);
+    static bool initImportEntryProto(JSContext* cx, Handle<GlobalObject*> global);
+    static bool initExportEntryProto(JSContext* cx, Handle<GlobalObject*> global);
+
     // Implemented in builtin/TypedObject.cpp
     static bool initTypedObjectModule(JSContext* cx, Handle<GlobalObject*> global);
+
+    // Implemented in builtim/SIMD.cpp
+    static bool initSimdObject(JSContext* cx, Handle<GlobalObject*> global);
 
     static bool initStandardClasses(JSContext* cx, Handle<GlobalObject*> global);
     static bool initSelfHostingBuiltins(JSContext* cx, Handle<GlobalObject*> global,

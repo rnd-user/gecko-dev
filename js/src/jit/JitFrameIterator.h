@@ -171,6 +171,9 @@ class JitFrameIterator
     bool isIonStub() const {
         return type_ == JitFrame_IonStub;
     }
+    bool isIonStubMaybeUnwound() const {
+        return type_ == JitFrame_IonStub || type_ == JitFrame_Unwound_IonStub;
+    }
     bool isBailoutJS() const {
         return type_ == JitFrame_Bailout;
     }
@@ -819,8 +822,7 @@ class InlineFrameIterator
         return computeScopeChain(v, fallback);
     }
 
-    Value thisValue(MaybeReadFallback& fallback) const {
-        // MOZ_ASSERT(isConstructing(...));
+    Value thisArgument(MaybeReadFallback& fallback) const {
         SnapshotIterator s(si_);
 
         // scopeChain

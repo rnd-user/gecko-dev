@@ -236,7 +236,7 @@ var Settings = {
           Cu.import("resource://gre/modules/Messaging.jsm");
           Messaging.sendRequest({
             type: "Settings:Show",
-            resource: "preferences_vendor",
+            resource: "preferences_privacy",
           });
         } else {
           // Show the data choices preferences on desktop.
@@ -328,6 +328,9 @@ var PingPicker = {
   _updateCurrentPingData: function() {
     const subsession = document.getElementById("show-subsession-data").checked;
     const ping = TelemetryController.getCurrentPingData(subsession);
+    if (!ping) {
+      return;
+    }
     displayPingData(ping, true);
   },
 
@@ -369,10 +372,10 @@ var PingPicker = {
         return d;
       };
 
-      this._weeks = [for (startTime of weekStartDates.values()) {
+      this._weeks = Array.from(weekStartDates.values(), startTime => ({
         startDate: new Date(startTime),
         endDate: plusOneWeek(new Date(startTime)),
-      }];
+      }));
 
       // Render the archive data.
       this._renderWeeks();
@@ -928,11 +931,11 @@ var ThreadHangStats = {
   /**
    * Renders raw thread hang stats data
    */
-  render: function(aPing) {
+  render: function(aPayload) {
     let div = document.getElementById("thread-hang-stats");
     removeAllChildNodes(div);
 
-    let stats = aPing.payload.threadHangStats;
+    let stats = aPayload.threadHangStats;
     setHasData("thread-hang-stats-section", stats && (stats.length > 0));
     if (!stats) {
       return;
@@ -1038,7 +1041,7 @@ var Histogram = {
   },
 
   processHistogram: function(aHgram, aName) {
-    const values = [for (k of Object.keys(aHgram.values)) aHgram.values[k]];
+    const values = Object.keys(aHgram.values).map(k => aHgram.values[k]);
     if (!values.length) {
       // If we have no values collected for this histogram, just return
       // zero values so we still render it.
@@ -1055,7 +1058,7 @@ var Histogram = {
     const average = Math.round(aHgram.sum * 10 / sample_count) / 10;
     const max_value = Math.max(...values);
 
-    const labelledValues = [for (k of Object.keys(aHgram.values)) [Number(k), aHgram.values[k]]];
+    const labelledValues = Object.keys(aHgram.values).map(k => [Number(k), aHgram.values[k]]);
 
     let result = {
       values: labelledValues,
@@ -1104,7 +1107,7 @@ var Histogram = {
               + " ".repeat(Math.max(0, labelPadTo - String(label).length)) + label // Right-aligned label
               + " |" + "#".repeat(Math.round(MAX_BAR_CHARS * barValue / maxBarValue)) // Bar
               + "  " + value // Value
-              + "  " + Math.round(100 * value / aHgram.sum) + "%"; // Percentage
+              + "  " + Math.round(100 * value / aHgram.sample_count) + "%"; // Percentage
 
       // Construct the HTML labels + bars
       let belowEm = Math.round(MAX_BAR_HEIGHT * (barValue / maxBarValue) * 10) / 10;
@@ -1605,9 +1608,6 @@ function displayPingData(ping, updatePayloadList = false) {
   // Show chrome hang stacks
   ChromeHangs.render(ping);
 
-  // Show thread hang stats
-  ThreadHangStats.render(ping);
-
   // Render Addon details.
   AddonDetails.render(ping);
 
@@ -1620,6 +1620,9 @@ function displayPingData(ping, updatePayloadList = false) {
   if (payloadIndex > 0) {
     payload = ping.payload.childPayloads[payloadIndex - 1];
   }
+
+  // Show thread hang stats
+  ThreadHangStats.render(payload);
 
   // Show simple measurements
   let simpleMeasurements = sortStartupMilestones(payload.simpleMeasurements);
@@ -1635,10 +1638,10 @@ function displayPingData(ping, updatePayloadList = false) {
 
   LateWritesSingleton.renderLateWrites(payload.lateWrites);
 
-  // Show basic system info gathered
+  // Show basic session info gathered
   hasData = Object.keys(ping.payload.info).length > 0;
-  setHasData("system-info-section", hasData);
-  let infoSection = document.getElementById("system-info");
+  setHasData("session-info-section", hasData);
+  let infoSection = document.getElementById("session-info");
   removeAllChildNodes(infoSection);
 
   if (hasData) {

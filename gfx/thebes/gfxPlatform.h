@@ -337,7 +337,8 @@ public:
     CreateFontGroup(const mozilla::FontFamilyList& aFontFamilyList,
                     const gfxFontStyle *aStyle,
                     gfxTextPerfMetrics* aTextPerf,
-                    gfxUserFontSet *aUserFontSet) = 0;
+                    gfxUserFontSet *aUserFontSet,
+                    gfxFloat aDevToCssSize) = 0;
                                           
     /**
      * Look up a local platform font using the full font face name.
@@ -514,6 +515,9 @@ public:
 
     int32_t GetBidiNumeralOption();
 
+    static void
+    FlushFontAndWordCaches();
+
     /**
      * Returns a 1x1 surface that can be used to create graphics contexts
      * for measuring text etc as if they will be rendered to the screen
@@ -628,6 +632,11 @@ public:
     // Return information on how child processes should initialize graphics
     // devices. Currently this is only used on Windows.
     virtual void GetDeviceInitData(mozilla::gfx::DeviceInitData* aOut);
+
+    // Plugin async drawing support.
+    virtual bool SupportsPluginDirectBitmapDrawing() {
+      return false;
+    }
 
 protected:
     gfxPlatform();

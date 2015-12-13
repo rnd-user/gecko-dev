@@ -399,6 +399,7 @@ class IonBuilder
     MInstruction* addShapeGuard(MDefinition* obj, Shape* const shape, BailoutKind bailoutKind);
     MInstruction* addGroupGuard(MDefinition* obj, ObjectGroup* group, BailoutKind bailoutKind);
     MInstruction* addUnboxedExpandoGuard(MDefinition* obj, bool hasExpando, BailoutKind bailoutKind);
+    MInstruction* addSharedTypedArrayGuard(MDefinition* obj);
 
     MInstruction*
     addGuardReceiverPolymorphic(MDefinition* obj, const BaselineInspector::ReceiverVector& receivers);
@@ -432,6 +433,8 @@ class IonBuilder
     bool getPropTryConstant(bool* emitted, MDefinition* obj, jsid id, TemporaryTypeSet* types);
     bool getPropTryDefiniteSlot(bool* emitted, MDefinition* obj, PropertyName* name,
                                 BarrierKind barrier, TemporaryTypeSet* types);
+    bool getPropTryModuleNamespace(bool* emitted, MDefinition* obj, PropertyName* name,
+                                   BarrierKind barrier, TemporaryTypeSet* types);
     bool getPropTryUnboxed(bool* emitted, MDefinition* obj, PropertyName* name,
                            BarrierKind barrier, TemporaryTypeSet* types);
     bool getPropTryCommonGetter(bool* emitted, MDefinition* obj, PropertyName* name,
@@ -455,6 +458,7 @@ class IonBuilder
                             TemporaryTypeSet* types);
     bool getPropTryCache(bool* emitted, MDefinition* obj, PropertyName* name,
                          BarrierKind barrier, TemporaryTypeSet* types);
+    bool getPropTrySharedStub(bool* emitted, MDefinition* obj);
 
     // jsop_setprop() helpers.
     bool setPropTryCommonSetter(bool* emitted, MDefinition* obj,
@@ -665,6 +669,7 @@ class IonBuilder
     bool jsop_funcall(uint32_t argc);
     bool jsop_funapply(uint32_t argc);
     bool jsop_funapplyarguments(uint32_t argc);
+    bool jsop_funapplyarray(uint32_t argc);
     bool jsop_call(uint32_t argc, bool constructing);
     bool jsop_eval(uint32_t argc);
     bool jsop_ifeq(JSOp op);
@@ -682,7 +687,9 @@ class IonBuilder
     bool jsop_getgname(PropertyName* name);
     bool jsop_getname(PropertyName* name);
     bool jsop_intrinsic(PropertyName* name);
+    bool jsop_getimport(PropertyName* name);
     bool jsop_bindname(PropertyName* name);
+    bool jsop_bindvar();
     bool jsop_getelem();
     bool jsop_getelem_dense(MDefinition* obj, MDefinition* index, JSValueType unboxedType);
     bool jsop_getelem_typed(MDefinition* obj, MDefinition* index, ScalarTypeDescr::Type arrayType);
@@ -716,7 +723,8 @@ class IonBuilder
     bool jsop_object(JSObject* obj);
     bool jsop_lambda(JSFunction* fun);
     bool jsop_lambda_arrow(JSFunction* fun);
-    bool jsop_this();
+    bool jsop_functionthis();
+    bool jsop_globalthis();
     bool jsop_typeof();
     bool jsop_toid();
     bool jsop_iter(uint8_t flags);
@@ -730,6 +738,7 @@ class IonBuilder
     bool jsop_setaliasedvar(ScopeCoordinate sc);
     bool jsop_debugger();
     bool jsop_newtarget();
+    bool jsop_checkobjcoercible();
 
     /* Inlining. */
 
@@ -879,8 +888,6 @@ class IonBuilder
     InliningStatus inlineSimdStore(CallInfo& callInfo, JSNative native, SimdTypeDescr::Type type,
                                    unsigned numElems);
 
-    InliningStatus inlineSimdBool(CallInfo& callInfo, JSNative native, SimdTypeDescr::Type type);
-
     // Utility intrinsics.
     InliningStatus inlineIsCallable(CallInfo& callInfo);
     InliningStatus inlineIsObject(CallInfo& callInfo);
@@ -927,6 +934,7 @@ class IonBuilder
     };
 
     bool atomicsMeetsPreconditions(CallInfo& callInfo, Scalar::Type* arrayElementType,
+                                   bool* requiresDynamicCheck,
                                    AtomicCheckResult checkResult=DoCheckAtomicResult);
     void atomicsCheckBounds(CallInfo& callInfo, MInstruction** elements, MDefinition** index);
 
@@ -1016,6 +1024,10 @@ class IonBuilder
     // A builder is inextricably tied to a particular script.
     JSScript* script_;
 
+    // script->hasIonScript() at the start of the compilation. Used to avoid
+    // calling hasIonScript() from background compilation threads.
+    bool scriptHasIonScript_;
+
     // If off thread compilation is successful, the final code generator is
     // attached here. Code has been generated, but not linked (there is not yet
     // an IonScript). This is heap allocated, and must be explicitly destroyed,
@@ -1035,6 +1047,7 @@ class IonBuilder
     JSObject* checkNurseryObject(JSObject* obj);
 
     JSScript* script() const { return script_; }
+    bool scriptHasIonScript() const { return scriptHasIonScript_; }
 
     CodeGenerator* backgroundCodegen() const { return backgroundCodegen_; }
     void setBackgroundCodegen(CodeGenerator* codegen) { backgroundCodegen_ = codegen; }
@@ -1257,7 +1270,7 @@ class IonBuilder
     }
 
     bool forceInlineCaches() {
-        return MOZ_UNLIKELY(js_JitOptions.forceInlineCaches);
+        return MOZ_UNLIKELY(JitOptions.forceInlineCaches);
     }
 
     // Out-of-line variants that don't check if optimization tracking is
@@ -1429,7 +1442,7 @@ class CallInfo
     }
 };
 
-bool NeedsPostBarrier(CompileInfo& info, MDefinition* value);
+bool NeedsPostBarrier(MDefinition* value);
 
 } // namespace jit
 } // namespace js

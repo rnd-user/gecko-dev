@@ -3662,16 +3662,16 @@ struct IsAboutToBeFinalizedFunctor {
     }
 };
 
+/* static */ bool
+UniqueIdGCPolicy::needsSweep(Cell** cell, uint64_t*)
+{
+    return DispatchTraceKindTyped(IsAboutToBeFinalizedFunctor(), (*cell)->getTraceKind(), cell);
+}
+
 void
 JS::Zone::sweepUniqueIds(js::FreeOp* fop)
 {
-    for (UniqueIdMap::Enum e(uniqueIds_); !e.empty(); e.popFront()) {
-        if (DispatchTraceKindTyped(IsAboutToBeFinalizedFunctor(), e.front().key()->getTraceKind(),
-                                   &e.front().mutableKey()))
-        {
-            e.removeFront();
-        }
-    }
+    uniqueIds_.sweep();
 }
 
 /*
@@ -4050,6 +4050,18 @@ GCRuntime::beginMarkPhase(JS::gcreason::Reason reason)
         bufferGrayRoots();
     }
 
+    markCompartments();
+
+    foundBlackGrayEdges = false;
+
+    return true;
+}
+
+void
+GCRuntime::markCompartments()
+{
+    gcstats::AutoPhase ap(stats, gcstats::PHASE_MARK_COMPARTMENTS);
+
     /*
      * This code ensures that if a compartment is "dead", then it will be
      * collected in this GC. A compartment is considered dead if its maybeAlive
@@ -4074,31 +4086,27 @@ GCRuntime::beginMarkPhase(JS::gcreason::Reason reason)
      * allocation and read barriers during JS_TransplantObject and the like.
      */
 
-    {
-        gcstats::AutoPhase ap(stats, gcstats::PHASE_MARK_COMPARTMENTS);
-
-        /* Set the maybeAlive flag based on cross-compartment edges. */
-        for (CompartmentsIter c(rt, SkipAtoms); !c.done(); c.next()) {
-            for (JSCompartment::WrapperEnum e(c); !e.empty(); e.popFront()) {
-                const CrossCompartmentKey& key = e.front().key();
-                JSCompartment* dest;
-                switch (key.kind) {
-                  case CrossCompartmentKey::ObjectWrapper:
-                  case CrossCompartmentKey::DebuggerObject:
-                  case CrossCompartmentKey::DebuggerSource:
-                  case CrossCompartmentKey::DebuggerEnvironment:
-                    dest = static_cast<JSObject*>(key.wrapped)->compartment();
-                    break;
-                  case CrossCompartmentKey::DebuggerScript:
-                    dest = static_cast<JSScript*>(key.wrapped)->compartment();
-                    break;
-                  default:
-                    dest = nullptr;
-                    break;
-                }
-                if (dest)
-                    dest->maybeAlive = true;
+    /* Set the maybeAlive flag based on cross-compartment edges. */
+    for (CompartmentsIter c(rt, SkipAtoms); !c.done(); c.next()) {
+        for (JSCompartment::WrapperEnum e(c); !e.empty(); e.popFront()) {
+            const CrossCompartmentKey& key = e.front().key();
+            JSCompartment* dest;
+            switch (key.kind) {
+              case CrossCompartmentKey::ObjectWrapper:
+              case CrossCompartmentKey::DebuggerObject:
+              case CrossCompartmentKey::DebuggerSource:
+              case CrossCompartmentKey::DebuggerEnvironment:
+                dest = static_cast<JSObject*>(key.wrapped)->compartment();
+                break;
+              case CrossCompartmentKey::DebuggerScript:
+                dest = static_cast<JSScript*>(key.wrapped)->compartment();
+                break;
+              default:
+                dest = nullptr;
+                break;
             }
+            if (dest)
+                dest->maybeAlive = true;
         }
     }
 
@@ -4111,9 +4119,6 @@ GCRuntime::beginMarkPhase(JS::gcreason::Reason reason)
         if (!c->maybeAlive && !rt->isAtomsCompartment(c))
             c->scheduledForDestruction = true;
     }
-    foundBlackGrayEdges = false;
-
-    return true;
 }
 
 template <class ZoneIterT>

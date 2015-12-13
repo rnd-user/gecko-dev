@@ -236,8 +236,6 @@ public:
     return SubjectPrincipal();
   }
 
-  static bool     IsImageSrcSetDisabled();
-
   static bool LookupBindingMember(JSContext* aCx, nsIContent *aContent,
                                   JS::Handle<jsid> aId,
                                   JS::MutableHandle<JSPropertyDescriptor> aDesc);
@@ -1032,6 +1030,14 @@ public:
   static nsContentPolicyType InternalContentPolicyTypeToExternalOrWorker(nsContentPolicyType aType);
 
   /**
+   * Returns true if the content policy type is any of:
+   *   * TYPE_INTERNAL_SCRIPT_PRELOAD
+   *   * TYPE_INTERNAL_IMAGE_PRELOAD
+   *   * TYPE_INTERNAL_STYLESHEET_PRELOAD
+   */
+  static bool IsPreloadType(nsContentPolicyType aType);
+
+  /**
    * Quick helper to determine whether there are any mutation listeners
    * of a given type that apply to this content or any of its ancestors.
    * The method has the side effect to call document's MayDispatchMutationEvent
@@ -1659,6 +1665,11 @@ public:
   // ipdl types in WindowWatcher.
   static nsIWindowProvider*
   GetWindowProviderForContentProcess();
+
+  // Returns the browser window with the most recent time stamp that is
+  // not in private browsing mode.
+  static already_AddRefed<nsPIDOMWindow>
+  GetMostRecentNonPBWindow();
 
   /**
    * Call this function if !IsSafeToRunScript() and we fail to run the script

@@ -38,7 +38,11 @@ namespace widget {
  * IMEHandler
  ******************************************************************************/
 
+nsWindow* IMEHandler::sFocusedWindow = nullptr;
+InputContextAction::Cause IMEHandler::sLastContextActionCause =
+  InputContextAction::CAUSE_UNKNOWN;
 bool IMEHandler::sPluginHasFocus = false;
+
 #ifdef NS_ENABLE_TSF
 bool IMEHandler::sIsInTSFMode = false;
 bool IMEHandler::sIsIMMEnabled = true;
@@ -90,8 +94,31 @@ IMEHandler::Terminate()
 
 // static
 void*
-IMEHandler::GetNativeData(uint32_t aDataType)
+IMEHandler::GetNativeData(nsWindow* aWindow, uint32_t aDataType)
 {
+  if (aDataType == NS_RAW_NATIVE_IME_CONTEXT) {
+#ifdef NS_ENABLE_TSF
+    if (IsTSFAvailable()) {
+      return TSFTextStore::GetThreadManager();
+    }
+#endif // #ifdef NS_ENABLE_TSF
+    IMEContext context(aWindow);
+    if (context.IsValid()) {
+      return context.get();
+    }
+    // If IMC isn't associated with the window, IME is disabled on the window
+    // now.  In such case, we should return default IMC instead.
+    const IMEContext& defaultIMC = aWindow->DefaultIMC();
+    if (defaultIMC.IsValid()) {
+      return defaultIMC.get();
+    }
+    // If there is no default IMC, we should return the pointer to the window
+    // since if we return nullptr, IMEStateManager cannot manage composition
+    // with TextComposition instance.  This is possible if no IME is installed,
+    // but composition may occur with dead key sequence.
+    return aWindow;
+  }
+
 #ifdef NS_ENABLE_TSF
   void* result = TSFTextStore::GetNativeData(aDataType);
   if (!result || !(*(static_cast<void**>(result)))) {
@@ -217,6 +244,7 @@ IMEHandler::NotifyIME(nsWindow* aWindow,
       case NOTIFY_IME_OF_TEXT_CHANGE:
         return TSFTextStore::OnTextChange(aIMENotification);
       case NOTIFY_IME_OF_FOCUS: {
+        sFocusedWindow = aWindow;
         IMMHandler::OnFocusChange(true, aWindow);
         nsresult rv =
           TSFTextStore::OnFocusChange(true, aWindow,
@@ -225,6 +253,7 @@ IMEHandler::NotifyIME(nsWindow* aWindow,
         return rv;
       }
       case NOTIFY_IME_OF_BLUR:
+        sFocusedWindow = nullptr;
         IMEHandler::MaybeDismissOnScreenKeyboard();
         IMMHandler::OnFocusChange(false, aWindow);
         return TSFTextStore::OnFocusChange(false, aWindow,
@@ -331,6 +360,16 @@ IMEHandler::GetOpenState(nsWindow* aWindow)
 void
 IMEHandler::OnDestroyWindow(nsWindow* aWindow)
 {
+  // When focus is in remote process, but the window is being destroyed, we
+  // need to clean up TSFTextStore here since NOTIFY_IME_OF_BLUR won't reach
+  // here because TabParent already lost the reference to the nsWindow when
+  // it receives from the remote process.
+  if (sFocusedWindow == aWindow) {
+    NS_ASSERTION(aWindow->GetInputContext().IsOriginContentProcess(),
+      "input context of focused widget should be set from a remote process");
+    NotifyIME(aWindow, IMENotification(NOTIFY_IME_OF_BLUR));
+  }
+
 #ifdef NS_ENABLE_TSF
   // We need to do nothing here for TSF. Just restore the default context
   // if it's been disassociated.
@@ -349,6 +388,7 @@ IMEHandler::SetInputContext(nsWindow* aWindow,
                             InputContext& aInputContext,
                             const InputContextAction& aAction)
 {
+  sLastContextActionCause = aAction.mCause;
   // FYI: If there is no composition, this call will do nothing.
   NotifyIME(aWindow, IMENotification(REQUEST_TO_COMMIT_COMPOSITION));
 
@@ -357,20 +397,21 @@ IMEHandler::SetInputContext(nsWindow* aWindow,
   // Assume that SetInputContext() is called only when aWindow has focus.
   sPluginHasFocus = (aInputContext.mIMEState.mEnabled == IMEState::PLUGIN);
 
+  if (aAction.UserMightRequestOpenVKB()) {
+    IMEHandler::MaybeShowOnScreenKeyboard();
+  }
+
   bool enable = WinUtils::IsIMEEnabled(aInputContext);
   bool adjustOpenState = (enable &&
     aInputContext.mIMEState.mOpen != IMEState::DONT_CHANGE_OPEN_STATE);
   bool open = (adjustOpenState &&
     aInputContext.mIMEState.mOpen == IMEState::OPEN);
 
-  aInputContext.mNativeIMEContext = nullptr;
-
 #ifdef NS_ENABLE_TSF
   // Note that even while a plugin has focus, we need to notify TSF of that.
   if (sIsInTSFMode) {
     TSFTextStore::SetInputContext(aWindow, aInputContext, aAction);
     if (IsTSFAvailable()) {
-      aInputContext.mNativeIMEContext = TSFTextStore::GetThreadManager();
       if (sIsIMMEnabled) {
         // Associate IME context for IMM-IMEs.
         AssociateIMEContext(aWindow, enable);
@@ -396,15 +437,6 @@ IMEHandler::SetInputContext(nsWindow* aWindow,
   if (adjustOpenState) {
     context.SetOpenState(open);
   }
-
-  if (aInputContext.mNativeIMEContext) {
-    return;
-  }
-
-  // The old InputContext must store the default IMC or old TextStore.
-  // When IME context is disassociated from the window, use it.
-  aInputContext.mNativeIMEContext = enable ?
-    static_cast<void*>(context.get()) : oldInputContext.mNativeIMEContext;
 }
 
 // static
@@ -435,8 +467,6 @@ IMEHandler::InitInputContext(nsWindow* aWindow, InputContext& aInputContext)
     TSFTextStore::SetInputContext(aWindow, aInputContext,
       InputContextAction(InputContextAction::CAUSE_UNKNOWN,
                          InputContextAction::GOT_FOCUS));
-    aInputContext.mNativeIMEContext = TSFTextStore::GetThreadManager();
-    MOZ_ASSERT(aInputContext.mNativeIMEContext);
     // IME context isn't necessary in pure TSF mode.
     if (!sIsIMMEnabled) {
       AssociateIMEContext(aWindow, false);
@@ -445,15 +475,11 @@ IMEHandler::InitInputContext(nsWindow* aWindow, InputContext& aInputContext)
   }
 #endif // #ifdef NS_ENABLE_TSF
 
-  // NOTE: mNativeIMEContext may be null if IMM module isn't installed.
+#ifdef DEBUG
+  // NOTE: IMC may be null if IMM module isn't installed.
   IMEContext context(aWindow);
-  aInputContext.mNativeIMEContext = static_cast<void*>(context.get());
-  MOZ_ASSERT(aInputContext.mNativeIMEContext || !CurrentKeyboardLayoutHasIME());
-  // If no IME context is available, we should set the widget's pointer since
-  // nullptr indicates there is only one context per process on the platform.
-  if (!aInputContext.mNativeIMEContext) {
-    aInputContext.mNativeIMEContext = static_cast<void*>(aWindow);
-  }
+  MOZ_ASSERT(context.IsValid() || !CurrentKeyboardLayoutHasIME());
+#endif // #ifdef DEBUG
 }
 
 #ifdef DEBUG
@@ -690,6 +716,14 @@ IMEHandler::IsKeyboardPresentOnSlate()
   if (::GetSystemMetrics(SM_CONVERTIBLESLATEMODE) != 0) {
     Preferences::SetString(kOskDebugReason, L"IKPOS: ConvertibleSlateMode is non-zero");
     return true;
+  }
+
+  // Before we check for a keyboard, we should check if the last input was touch,
+  // in which case we ignore whether or not a keyboard is present:
+  if (sLastContextActionCause == InputContextAction::CAUSE_TOUCH) {
+    Preferences::SetString(kOskDebugReason,
+      L"IKPOS: Used touch to focus control, ignoring keyboard presence");
+    return false;
   }
 
   const GUID KEYBOARD_CLASS_GUID =

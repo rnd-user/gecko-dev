@@ -72,7 +72,6 @@ class nsIRequest;
 class nsIRunnable;
 class nsIStreamListener;
 class nsIStructuredCloneContainer;
-class nsIStyleSheet;
 class nsIURI;
 class nsIVariant;
 class nsLocation;
@@ -156,8 +155,8 @@ typedef CallbackObjectHolder<NodeFilter, nsIDOMNodeFilter> NodeFilterHolder;
 } // namespace mozilla
 
 #define NS_IDOCUMENT_IID \
-{ 0x4307abe8, 0x5386, 0x4024, \
-  { 0xa2, 0xfe, 0x4a, 0x80, 0xe8, 0x47, 0x46, 0x90 } }
+{ 0x13011a82, 0x46cd, 0x4c33, \
+  { 0x9d, 0x4e, 0x31, 0x41, 0xbb, 0x3f, 0x18, 0xe9 } }
 
 // Enum for requesting a particular type of document when creating a doc
 enum DocumentFlavor {
@@ -297,6 +296,11 @@ public:
   virtual void SetChromeXHRDocBaseURI(nsIURI* aURI) = 0;
 
   /**
+   * Set referrer policy and upgrade-insecure-requests flags
+   */
+  virtual void ApplySettingsFromCSP(bool aSpeculative) = 0;
+
+  /**
    * Return the referrer policy of the document. Return "default" if there's no
    * valid meta referrer tag found in the document.
    */
@@ -323,6 +327,14 @@ public:
   bool GetUpgradeInsecureRequests() const
   {
     return mUpgradeInsecureRequests;
+  }
+
+  /**
+   * Same as GetUpgradeInsecureRequests() but *only* for preloads.
+   */
+  bool GetUpgradeInsecurePreloads() const
+  {
+    return mUpgradeInsecurePreloads;
   }
 
   /**
@@ -794,7 +806,9 @@ public:
     return mAnonymousContents;
   }
 
-  nsresult GetId(nsAString& aId);
+  static nsresult GenerateDocumentId(nsAString& aId);
+  nsresult GetOrCreateId(nsAString& aId);
+  void SetId(const nsAString& aId);
 
 protected:
   virtual Element *GetRootElementInternal() const = 0;
@@ -912,7 +926,7 @@ public:
    * @return the stylesheet at aIndex.  Null if aIndex is out of range.
    * @throws no exceptions
    */
-  virtual nsIStyleSheet* GetStyleSheetAt(int32_t aIndex) const = 0;
+  virtual mozilla::CSSStyleSheet* GetStyleSheetAt(int32_t aIndex) const = 0;
 
   /**
    * Insert a sheet at a particular spot in the stylesheet list (zero-based)
@@ -921,7 +935,8 @@ public:
    *   adjusted for the "special" sheets.
    * @throws no exceptions
    */
-  virtual void InsertStyleSheetAt(nsIStyleSheet* aSheet, int32_t aIndex) = 0;
+  virtual void InsertStyleSheetAt(mozilla::CSSStyleSheet* aSheet,
+                                  int32_t aIndex) = 0;
 
   /**
    * Get the index of a particular stylesheet.  This will _always_
@@ -929,7 +944,7 @@ public:
    * @param aSheet the sheet to get the index of
    * @return aIndex the index of the sheet in the full list
    */
-  virtual int32_t GetIndexOfStyleSheet(nsIStyleSheet* aSheet) const = 0;
+  virtual int32_t GetIndexOfStyleSheet(mozilla::CSSStyleSheet* aSheet) const = 0;
 
   /**
    * Replace the stylesheets in aOldSheets with the stylesheets in
@@ -939,24 +954,25 @@ public:
    * may be null; if so the corresponding sheets in the first list
    * will simply be removed.
    */
-  virtual void UpdateStyleSheets(nsCOMArray<nsIStyleSheet>& aOldSheets,
-                                 nsCOMArray<nsIStyleSheet>& aNewSheets) = 0;
+  virtual void UpdateStyleSheets(
+      nsTArray<RefPtr<mozilla::CSSStyleSheet>>& aOldSheets,
+      nsTArray<RefPtr<mozilla::CSSStyleSheet>>& aNewSheets) = 0;
 
   /**
    * Add a stylesheet to the document
    */
-  virtual void AddStyleSheet(nsIStyleSheet* aSheet) = 0;
+  virtual void AddStyleSheet(mozilla::CSSStyleSheet* aSheet) = 0;
 
   /**
    * Remove a stylesheet from the document
    */
-  virtual void RemoveStyleSheet(nsIStyleSheet* aSheet) = 0;
+  virtual void RemoveStyleSheet(mozilla::CSSStyleSheet* aSheet) = 0;
 
   /**
    * Notify the document that the applicable state of the sheet changed
    * and that observers should be notified and style sets updated
    */
-  virtual void SetStyleSheetApplicableState(nsIStyleSheet* aSheet,
+  virtual void SetStyleSheetApplicableState(mozilla::CSSStyleSheet* aSheet,
                                             bool aApplicable) = 0;
 
   enum additionalSheetType {
@@ -966,10 +982,13 @@ public:
     AdditionalSheetTypeCount
   };
 
-  virtual nsresult LoadAdditionalStyleSheet(additionalSheetType aType, nsIURI* aSheetURI) = 0;
-  virtual nsresult AddAdditionalStyleSheet(additionalSheetType aType, nsIStyleSheet* aSheet) = 0;
-  virtual void RemoveAdditionalStyleSheet(additionalSheetType aType, nsIURI* sheetURI) = 0;
-  virtual nsIStyleSheet* FirstAdditionalAuthorSheet() = 0;
+  virtual nsresult LoadAdditionalStyleSheet(additionalSheetType aType,
+                                            nsIURI* aSheetURI) = 0;
+  virtual nsresult AddAdditionalStyleSheet(additionalSheetType aType,
+                                           mozilla::CSSStyleSheet* aSheet) = 0;
+  virtual void RemoveAdditionalStyleSheet(additionalSheetType aType,
+                                          nsIURI* sheetURI) = 0;
+  virtual mozilla::CSSStyleSheet* FirstAdditionalAuthorSheet() = 0;
 
   /**
    * Get this document's CSSLoader.  This is guaranteed to not return null.
@@ -1272,12 +1291,11 @@ public:
 
   // Observation hooks for style data to propagate notifications
   // to document observers
-  virtual void StyleRuleChanged(nsIStyleSheet* aStyleSheet,
-                                mozilla::css::Rule* aOldStyleRule,
-                                mozilla::css::Rule* aNewStyleRule) = 0;
-  virtual void StyleRuleAdded(nsIStyleSheet* aStyleSheet,
+  virtual void StyleRuleChanged(mozilla::CSSStyleSheet* aStyleSheet,
+                                mozilla::css::Rule* aStyleRule) = 0;
+  virtual void StyleRuleAdded(mozilla::CSSStyleSheet* aStyleSheet,
                               mozilla::css::Rule* aStyleRule) = 0;
-  virtual void StyleRuleRemoved(nsIStyleSheet* aStyleSheet,
+  virtual void StyleRuleRemoved(mozilla::CSSStyleSheet* aStyleSheet,
                                 mozilla::css::Rule* aStyleRule) = 0;
 
   /**
@@ -2713,6 +2731,7 @@ protected:
   ReferrerPolicyEnum mReferrerPolicy;
 
   bool mUpgradeInsecureRequests;
+  bool mUpgradeInsecurePreloads;
 
   mozilla::WeakPtr<nsDocShell> mDocumentContainer;
 
@@ -2795,11 +2814,15 @@ protected:
   // True iff we've ever fired a DOMTitleChanged event for this document
   bool mHaveFiredTitleChange : 1;
 
-  // True iff IsShowing() should be returning true
+  // State for IsShowing(). mIsShowing starts off false. It becomes true when
+  // OnPageShow happens and becomes false when OnPageHide happens. So it's false
+  // before the initial load completes and when we're in bfcache or unloaded,
+  // true otherwise.
   bool mIsShowing : 1;
 
-  // True iff the document "page" is not hidden (i.e. currently in the
-  // bfcache)
+  // State for IsVisible(). mVisible starts off true. It becomes false when
+  // OnPageHide happens, and becomes true again when OnPageShow happens.  So
+  // it's false only when we're in bfcache or unloaded.
   bool mVisible : 1;
 
   // True if our content viewer has been removed from the docshell

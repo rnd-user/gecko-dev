@@ -769,7 +769,7 @@ PresShell::PresShell()
   mIsThemeSupportDisabled = false;
   mIsActive = true;
   // FIXME/bug 735029: find a better solution to this problem
-#ifdef MOZ_WIDGET_ANDROID
+#if defined(MOZ_WIDGET_ANDROID) && !defined(MOZ_ANDROID_APZ)
   // The java pan/zoom code uses this to mean approximately "request a
   // reset of pan/zoom state" which doesn't necessarily correspond
   // with the first paint of content.
@@ -783,7 +783,6 @@ PresShell::PresShell()
   mPresArenaAllocCount = 0;
 #endif
   mRenderFlags = 0;
-  mResolution = 1.0;
 
   mScrollPositionClampingScrollPortSizeSet = false;
 
@@ -897,7 +896,7 @@ PresShell::Init(nsIDocument* aDocument,
 
   if (AccessibleCaretEnabled()) {
     // Need to happen before nsFrameSelection has been set up.
-    mAccessibleCaretEventHub = new AccessibleCaretEventHub();
+    mAccessibleCaretEventHub = new AccessibleCaretEventHub(this);
   }
 
   mSelection = new nsFrameSelection();
@@ -1083,6 +1082,20 @@ PresShell::Destroy()
     tp->Accumulate();
     if (tp->cumulative.numChars > 0) {
       LogTextPerfStats(tp, this, tp->cumulative, 0.0, eLog_totals, nullptr);
+    }
+  }
+  if (mPresContext) {
+    gfxUserFontSet* fs = mPresContext->GetUserFontSet();
+    if (fs) {
+      uint32_t fontCount;
+      uint64_t fontSize;
+      fs->GetLoadStatistics(fontCount, fontSize);
+      Telemetry::Accumulate(Telemetry::WEBFONT_PER_PAGE, fontCount);
+      Telemetry::Accumulate(Telemetry::WEBFONT_SIZE_PER_PAGE,
+                            uint32_t(fontSize/1024));
+    } else {
+      Telemetry::Accumulate(Telemetry::WEBFONT_PER_PAGE, 0);
+      Telemetry::Accumulate(Telemetry::WEBFONT_SIZE_PER_PAGE, 0);
     }
   }
 
@@ -1426,19 +1439,18 @@ PresShell::AddUserSheet(nsISupports* aSheet)
 
   mStyleSet->BeginUpdate();
 
-  nsStyleSheetService *sheetService = nsStyleSheetService::gInstance;
-  nsCOMArray<nsIStyleSheet> & userSheets = *sheetService->UserStyleSheets();
-  int32_t i;
+  nsStyleSheetService* sheetService = nsStyleSheetService::gInstance;
+  nsTArray<RefPtr<CSSStyleSheet>>& userSheets = *sheetService->UserStyleSheets();
   // Iterate forwards when removing so the searches for RemoveStyleSheet are as
   // short as possible.
-  for (i = 0; i < userSheets.Count(); ++i) {
-    mStyleSet->RemoveStyleSheet(SheetType::User, userSheets[i]);
+  for (CSSStyleSheet* sheet : userSheets) {
+    mStyleSet->RemoveStyleSheet(SheetType::User, sheet);
   }
 
   // Now iterate backwards, so that the order of userSheets will be the same as
   // the order of sheets from it in the style set.
-  for (i = userSheets.Count() - 1; i >= 0; --i) {
-    mStyleSet->PrependStyleSheet(SheetType::User, userSheets[i]);
+  for (CSSStyleSheet* sheet : Reversed(userSheets)) {
+    mStyleSet->PrependStyleSheet(SheetType::User, sheet);
   }
 
   mStyleSet->EndUpdate();
@@ -1451,7 +1463,7 @@ PresShell::AddAgentSheet(nsISupports* aSheet)
 {
   // Make sure this does what nsDocumentViewer::CreateStyleSet does
   // wrt ordering.
-  nsCOMPtr<nsIStyleSheet> sheet = do_QueryInterface(aSheet);
+  RefPtr<CSSStyleSheet> sheet = do_QueryObject(aSheet);
   if (!sheet) {
     return;
   }
@@ -1463,14 +1475,14 @@ PresShell::AddAgentSheet(nsISupports* aSheet)
 void
 PresShell::AddAuthorSheet(nsISupports* aSheet)
 {
-  nsCOMPtr<nsIStyleSheet> sheet = do_QueryInterface(aSheet);
+  RefPtr<CSSStyleSheet> sheet = do_QueryObject(aSheet);
   if (!sheet) {
     return;
   }
 
   // Document specific "additional" Author sheets should be stronger than the ones
   // added with the StyleSheetService.
-  nsIStyleSheet* firstAuthorSheet = mDocument->FirstAdditionalAuthorSheet();
+  CSSStyleSheet* firstAuthorSheet = mDocument->FirstAdditionalAuthorSheet();
   if (firstAuthorSheet) {
     mStyleSet->InsertStyleSheetBefore(SheetType::Doc, sheet, firstAuthorSheet);
   } else {
@@ -1483,7 +1495,7 @@ PresShell::AddAuthorSheet(nsISupports* aSheet)
 void
 PresShell::RemoveSheet(SheetType aType, nsISupports* aSheet)
 {
-  nsCOMPtr<nsIStyleSheet> sheet = do_QueryInterface(aSheet);
+  RefPtr<CSSStyleSheet> sheet = do_QueryObject(aSheet);
   if (!sheet) {
     return;
   }
@@ -1675,11 +1687,6 @@ PresShell::Initialize(nscoord aWidth, nscoord aHeight)
       NS_ENSURE_STATE(!mHaveShutDown);
 
       mFrameConstructor->EndUpdate();
-    }
-
-    // Initialize after nsCanvasFrame is created.
-    if (mAccessibleCaretEventHub) {
-      mAccessibleCaretEventHub->Init(this);
     }
 
     // nsAutoScriptBlocker going out of scope may have killed us too
@@ -2307,27 +2314,6 @@ PresShell::CheckVisibilityContent(nsIContent* aNode, int16_t aStartOffset,
 
   *aRetval = false;
   DoCheckVisibility(mPresContext, aNode, aStartOffset, aEndOffset, aRetval);
-  return NS_OK;
-}
-
-NS_IMETHODIMP
-PresShell::GetSelectionCaretsVisibility(bool* aOutVisibility)
-{
-  *aOutVisibility = (SelectionCaretPrefEnabled() &&
-    mSelectionCarets && mSelectionCarets->GetVisibility());
-  return NS_OK;
-}
-
-NS_IMETHODIMP
-PresShell::SetSelectionCaretsVisibility(bool aVisibility)
-{
-  if (SelectionCaretPrefEnabled() && mSelectionCarets) {
-    if (aVisibility) {
-      mSelectionCarets->UpdateSelectionCarets();
-    } else {
-      mSelectionCarets->SetVisibility(false);
-    }
-  }
   return NS_OK;
 }
 
@@ -4506,7 +4492,7 @@ nsIPresShell::ReconstructStyleDataExternal()
 }
 
 void
-PresShell::RecordStyleSheetChange(nsIStyleSheet* aStyleSheet)
+PresShell::RecordStyleSheetChange(CSSStyleSheet* aStyleSheet)
 {
   // too bad we can't check that the update is UPDATE_STYLE
   NS_ASSERTION(mUpdateCount != 0, "must be in an update");
@@ -4527,8 +4513,8 @@ PresShell::RecordStyleSheetChange(nsIStyleSheet* aStyleSheet)
 }
 
 void
-PresShell::StyleSheetAdded(nsIDocument *aDocument,
-                           nsIStyleSheet* aStyleSheet,
+PresShell::StyleSheetAdded(nsIDocument* aDocument,
+                           CSSStyleSheet* aStyleSheet,
                            bool aDocumentSheet)
 {
   // We only care when enabled sheets are added
@@ -4540,8 +4526,8 @@ PresShell::StyleSheetAdded(nsIDocument *aDocument,
 }
 
 void
-PresShell::StyleSheetRemoved(nsIDocument *aDocument,
-                             nsIStyleSheet* aStyleSheet,
+PresShell::StyleSheetRemoved(nsIDocument* aDocument,
+                             CSSStyleSheet* aStyleSheet,
                              bool aDocumentSheet)
 {
   // We only care when enabled sheets are removed
@@ -4553,8 +4539,8 @@ PresShell::StyleSheetRemoved(nsIDocument *aDocument,
 }
 
 void
-PresShell::StyleSheetApplicableStateChanged(nsIDocument *aDocument,
-                                            nsIStyleSheet* aStyleSheet,
+PresShell::StyleSheetApplicableStateChanged(nsIDocument* aDocument,
+                                            CSSStyleSheet* aStyleSheet,
                                             bool aApplicable)
 {
   if (aStyleSheet->HasRules()) {
@@ -4563,25 +4549,24 @@ PresShell::StyleSheetApplicableStateChanged(nsIDocument *aDocument,
 }
 
 void
-PresShell::StyleRuleChanged(nsIDocument *aDocument,
-                            nsIStyleSheet* aStyleSheet,
-                            mozilla::css::Rule* aOldStyleRule,
-                            mozilla::css::Rule* aNewStyleRule)
+PresShell::StyleRuleChanged(nsIDocument* aDocument,
+                            CSSStyleSheet* aStyleSheet,
+                            mozilla::css::Rule* aStyleRule)
 {
   RecordStyleSheetChange(aStyleSheet);
 }
 
 void
-PresShell::StyleRuleAdded(nsIDocument *aDocument,
-                          nsIStyleSheet* aStyleSheet,
+PresShell::StyleRuleAdded(nsIDocument* aDocument,
+                          CSSStyleSheet* aStyleSheet,
                           mozilla::css::Rule* aStyleRule)
 {
   RecordStyleSheetChange(aStyleSheet);
 }
 
 void
-PresShell::StyleRuleRemoved(nsIDocument *aDocument,
-                            nsIStyleSheet* aStyleSheet,
+PresShell::StyleRuleRemoved(nsIDocument* aDocument,
+                            CSSStyleSheet* aStyleSheet,
                             mozilla::css::Rule* aStyleRule)
 {
   RecordStyleSheetChange(aStyleSheet);
@@ -5315,13 +5300,17 @@ nsresult PresShell::SetResolutionImpl(float aResolution, bool aScaleToResolution
   if (!(aResolution > 0.0)) {
     return NS_ERROR_ILLEGAL_VALUE;
   }
-  if (aResolution == mResolution) {
+  if (aResolution == mResolution.valueOr(0.0)) {
+    MOZ_ASSERT(mResolution.isSome());
     return NS_OK;
   }
   RenderingState state(this);
-  state.mResolution = aResolution;
+  state.mResolution = Some(aResolution);
   SetRenderingState(state);
   mScaleToResolution = aScaleToResolution;
+  if (mMobileViewportManager) {
+    mMobileViewportManager->ResolutionUpdated();
+  }
 
   return NS_OK;
 }
@@ -5337,6 +5326,25 @@ float PresShell::GetCumulativeResolution()
   nsPresContext* parentCtx = GetPresContext()->GetParentPresContext();
   if (parentCtx) {
     resolution *= parentCtx->PresShell()->GetCumulativeResolution();
+  }
+  return resolution;
+}
+
+float PresShell::GetCumulativeNonRootScaleResolution()
+{
+  float resolution = 1.0;
+  nsIPresShell* currentShell = this;
+  while (currentShell) {
+    nsPresContext* currentCtx = currentShell->GetPresContext();
+    if (currentCtx != currentCtx->GetRootPresContext()) {
+      resolution *=  currentShell->ScaleToResolution() ? currentShell->GetResolution() : 1.0f;
+    }
+    nsPresContext* parentCtx = currentCtx->GetParentPresContext();
+    if (parentCtx) {
+      currentShell = parentCtx->PresShell();
+    } else {
+      currentShell = nullptr;
+    }
   }
   return resolution;
 }
@@ -6104,7 +6112,7 @@ PresShell::Paint(nsView*        aViewToPaint,
       pc->GetVisibleArea().ToOutsidePixels(pc->AppUnitsPerDevPixel());
     bgcolor = NS_ComposeColors(bgcolor, mCanvasBackgroundColor);
     root->SetColor(Color::FromABGR(bgcolor));
-    root->SetVisibleRegion(bounds);
+    root->SetVisibleRegion(LayerIntRegion::FromUnknownRegion(bounds));
     layerManager->SetRoot(root);
   }
   MaybeSetupTransactionIdAllocator(layerManager, aViewToPaint);
@@ -6571,6 +6579,7 @@ FlushThrottledStyles(nsIDocument *aDocument, void *aData)
     }
   }
 
+  aDocument->EnumerateSubDocuments(FlushThrottledStyles, nullptr);
   return true;
 }
 
@@ -7087,8 +7096,9 @@ PresShell::HandleEvent(nsIFrame* aFrame,
       // document that is being captured.
       retargetEventDoc = capturingContent->GetCrossShadowCurrentDoc();
 #ifdef ANDROID
-    } else if (aEvent->mClass == eTouchEventClass ||
-              (aEvent->AsMouseEvent() && aEvent->AsMouseEvent()->inputSource == nsIDOMMouseEvent::MOZ_SOURCE_TOUCH)) {
+    } else if ((aEvent->mClass == eTouchEventClass) ||
+               (aEvent->mClass == eMouseEventClass) ||
+               (aEvent->mClass == eWheelEventClass)) {
       retargetEventDoc = GetTouchEventTargetDocument();
 #endif
     }
@@ -7143,9 +7153,9 @@ PresShell::HandleEvent(nsIFrame* aFrame,
       nsWeakFrame weakFrame(frame);
       {  // scope for scriptBlocker.
         nsAutoScriptBlocker scriptBlocker;
-        GetRootPresShell()->GetDocument()->
-          EnumerateSubDocuments(FlushThrottledStyles, nullptr);
+        FlushThrottledStyles(GetRootPresShell()->GetDocument(), nullptr);
       }
+
 
       if (!weakFrame.IsAlive()) {
         frame = GetNearestFrameContainingPresShell(this);
@@ -8607,34 +8617,37 @@ PresShell::IsVisible()
 }
 
 nsresult
-PresShell::GetAgentStyleSheets(nsCOMArray<nsIStyleSheet>& aSheets)
+PresShell::GetAgentStyleSheets(nsTArray<RefPtr<CSSStyleSheet>>& aSheets)
 {
   aSheets.Clear();
   int32_t sheetCount = mStyleSet->SheetCount(SheetType::Agent);
 
+  if (!aSheets.SetCapacity(sheetCount, fallible)) {
+    return NS_ERROR_OUT_OF_MEMORY;
+  }
+
   for (int32_t i = 0; i < sheetCount; ++i) {
-    nsIStyleSheet *sheet = mStyleSet->StyleSheetAt(SheetType::Agent, i);
-    if (!aSheets.AppendObject(sheet))
-      return NS_ERROR_OUT_OF_MEMORY;
+    CSSStyleSheet* sheet = mStyleSet->StyleSheetAt(SheetType::Agent, i);
+    aSheets.AppendElement(sheet);
   }
 
   return NS_OK;
 }
 
 nsresult
-PresShell::SetAgentStyleSheets(const nsCOMArray<nsIStyleSheet>& aSheets)
+PresShell::SetAgentStyleSheets(const nsTArray<RefPtr<CSSStyleSheet>>& aSheets)
 {
   return mStyleSet->ReplaceSheets(SheetType::Agent, aSheets);
 }
 
 nsresult
-PresShell::AddOverrideStyleSheet(nsIStyleSheet *aSheet)
+PresShell::AddOverrideStyleSheet(CSSStyleSheet* aSheet)
 {
   return mStyleSet->PrependStyleSheet(SheetType::Override, aSheet);
 }
 
 nsresult
-PresShell::RemoveOverrideStyleSheet(nsIStyleSheet *aSheet)
+PresShell::RemoveOverrideStyleSheet(CSSStyleSheet* aSheet)
 {
   return mStyleSet->RemoveStyleSheet(SheetType::Override, aSheet);
 }
@@ -9604,7 +9617,7 @@ CompareTrees(nsPresContext* aFirstPresContext, nsIFrame* aFirstFrame,
       }
     }
 
-    nsIntRect r1, r2;
+    LayoutDeviceIntRect r1, r2;
     nsView* v1;
     nsView* v2;
     for (nsFrameList::Enumerator e1(kids1), e2(kids2);
@@ -9649,10 +9662,11 @@ CompareTrees(nsPresContext* aFirstPresContext, nsIFrame* aFirstFrame,
             LogVerifyMessage(k1, k2, "child widgets are not matched\n");
           }
           else if (nullptr != w1) {
-            w1->GetBoundsUntyped(r1);
-            w2->GetBoundsUntyped(r2);
+            w1->GetBounds(r1);
+            w2->GetBounds(r2);
             if (!r1.IsEqualEdges(r2)) {
-              LogVerifyMessage(k1, k2, "(widget rects)", r1, r2);
+              LogVerifyMessage(k1, k2, "(widget rects)",
+                               r1.ToUnknownRect(), r2.ToUnknownRect());
             }
           }
         }
@@ -9737,7 +9751,7 @@ PresShell::CloneStyleSet(nsStyleSet* aSet)
 
   int32_t i, n = aSet->SheetCount(SheetType::Override);
   for (i = 0; i < n; i++) {
-    nsIStyleSheet* ss = aSet->StyleSheetAt(SheetType::Override, i);
+    CSSStyleSheet* ss = aSet->StyleSheetAt(SheetType::Override, i);
     if (ss)
       clone->AppendStyleSheet(SheetType::Override, ss);
   }
@@ -9746,7 +9760,7 @@ PresShell::CloneStyleSet(nsStyleSet* aSet)
 #if 0
   n = aSet->SheetCount(SheetType::Doc);
   for (i = 0; i < n; i++) {
-    nsIStyleSheet* ss = aSet->StyleSheetAt(SheetType::Doc, i);
+    CSSStyleSheet* ss = aSet->StyleSheetAt(SheetType::Doc, i);
     if (ss)
       clone->AddDocStyleSheet(ss, mDocument);
   }
@@ -9754,14 +9768,14 @@ PresShell::CloneStyleSet(nsStyleSet* aSet)
 
   n = aSet->SheetCount(SheetType::User);
   for (i = 0; i < n; i++) {
-    nsIStyleSheet* ss = aSet->StyleSheetAt(SheetType::User, i);
+    CSSStyleSheet* ss = aSet->StyleSheetAt(SheetType::User, i);
     if (ss)
       clone->AppendStyleSheet(SheetType::User, ss);
   }
 
   n = aSet->SheetCount(SheetType::Agent);
   for (i = 0; i < n; i++) {
-    nsIStyleSheet* ss = aSet->StyleSheetAt(SheetType::Agent, i);
+    CSSStyleSheet* ss = aSet->StyleSheetAt(SheetType::Agent, i);
     if (ss)
       clone->AppendStyleSheet(SheetType::Agent, ss);
   }
@@ -10160,9 +10174,7 @@ void ReflowCountMgr::PaintCount(const char*     aName,
 
       // We don't care about the document language or user fonts here;
       // just get a default Latin font.
-      nsFont font(eFamily_serif, NS_FONT_STYLE_NORMAL,
-                  NS_FONT_WEIGHT_NORMAL, NS_FONT_STRETCH_NORMAL, 0,
-                  nsPresContext::CSSPixelsToAppUnits(11));
+      nsFont font(eFamily_serif, nsPresContext::CSSPixelsToAppUnits(11));
       RefPtr<nsFontMetrics> fm;
       aPresContext->DeviceContext()->GetMetricsFor(font,
         nsGkAtoms::x_western, false, gfxFont::eHorizontal, nullptr,

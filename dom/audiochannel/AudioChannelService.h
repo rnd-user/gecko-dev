@@ -19,12 +19,16 @@
 
 class nsIRunnable;
 class nsPIDOMWindow;
+struct PRLogModuleInfo;
 
 namespace mozilla {
 namespace dom {
+
 #ifdef MOZ_WIDGET_GONK
 class SpeakerManagerService;
 #endif
+
+class TabParent;
 
 #define NUMBER_OF_AUDIO_CHANNELS (uint32_t)AudioChannel::EndGuard_
 
@@ -45,6 +49,8 @@ public:
 
   static bool IsAudioChannelMutedByDefault();
 
+  static PRLogModuleInfo* GetAudioChannelLog();
+
   /**
    * Any audio channel agent that starts playing should register itself to
    * this service, sharing the AudioChannel.
@@ -59,6 +65,12 @@ public:
    */
   void UnregisterAudioChannelAgent(AudioChannelAgent* aAgent,
                                    uint32_t aNotifyPlayback);
+
+  /**
+   * For nested iframes.
+   */
+  void RegisterTabParent(TabParent* aTabParent);
+  void UnregisterTabParent(TabParent* aTabParent);
 
   /**
    * Return the state to indicate this audioChannel for his window should keep
@@ -104,6 +116,9 @@ public:
   bool AnyAudioChannelIsActive();
 
   void RefreshAgentsVolume(nsPIDOMWindow* aWindow);
+
+  void RefreshAgentsVolumeAndPropagate(AudioChannel aAudioChannel,
+                                       nsPIDOMWindow* aWindow);
 
   // This method needs to know the inner window that wants to capture audio. We
   // group agents per top outer window, but we can have multiple innerWindow per
@@ -219,6 +234,9 @@ private:
 #ifdef MOZ_WIDGET_GONK
   nsTArray<SpeakerManagerService*>  mSpeakerManager;
 #endif
+
+  // Raw pointers because TabParents must unregister themselves.
+  nsTArray<TabParent*> mTabParents;
 
   nsCOMPtr<nsIRunnable> mRunnable;
 

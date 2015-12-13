@@ -37,6 +37,9 @@ class AnimValuesStyleRule;
 
 namespace dom {
 struct ComputedTimingProperties;
+class UnrestrictedDoubleOrKeyframeEffectOptions;
+enum class IterationCompositeOperation : uint32_t;
+enum class CompositeOperation : uint32_t;
 }
 
 /**
@@ -51,17 +54,11 @@ struct AnimationTiming
   TimeDuration mIterationDuration;
   TimeDuration mDelay;
   float mIterationCount; // mozilla::PositiveInfinity<float>() means infinite
-  uint8_t mDirection;
-  uint8_t mFillMode;
+  dom::PlaybackDirection mDirection;
+  dom::FillMode mFillMode;
 
-  bool FillsForwards() const {
-    return mFillMode == NS_STYLE_ANIMATION_FILL_MODE_BOTH ||
-           mFillMode == NS_STYLE_ANIMATION_FILL_MODE_FORWARDS;
-  }
-  bool FillsBackwards() const {
-    return mFillMode == NS_STYLE_ANIMATION_FILL_MODE_BOTH ||
-           mFillMode == NS_STYLE_ANIMATION_FILL_MODE_BACKWARDS;
-  }
+  bool FillsForwards() const;
+  bool FillsBackwards() const;
   bool operator==(const AnimationTiming& aOther) const {
     return mIterationDuration == aOther.mIterationDuration &&
            mDelay == aOther.mDelay &&
@@ -190,7 +187,7 @@ public:
   Constructor(const GlobalObject& aGlobal,
               Element* aTarget,
               const Optional<JS::Handle<JSObject*>>& aFrames,
-              const Optional<double>& aOptions,
+              const UnrestrictedDoubleOrKeyframeEffectOptions& aOptions,
               ErrorResult& aRv);
   Element* GetTarget() const {
     // Currently we never return animations from the API whose effect
@@ -213,13 +210,16 @@ public:
     aPseudoType = mPseudoType;
   }
 
-  const AnimationTiming& Timing() const {
-    return mTiming;
+  IterationCompositeOperation IterationComposite() const;
+  CompositeOperation Composite() const;
+  void GetSpacing(nsString& aRetVal) const {
+    aRetVal.AssignLiteral("distribute");
   }
-  AnimationTiming& Timing() {
-    return mTiming;
-  }
+
+  const AnimationTiming& Timing() const { return mTiming; }
+  AnimationTiming& Timing() { return mTiming; }
   void SetTiming(const AnimationTiming& aTiming);
+  void NotifyAnimationTimingUpdated() { UpdateTargetRegistration(); }
 
   Nullable<TimeDuration> GetLocalTime() const;
 
@@ -257,6 +257,7 @@ public:
   bool IsInEffect() const;
 
   void SetAnimation(Animation* aAnimation);
+  Animation* GetAnimation() const { return mAnimation; }
 
   const AnimationProperty*
   GetAnimationOfProperty(nsCSSProperty aProperty) const;
@@ -286,9 +287,22 @@ public:
 
   bool CanThrottle() const;
 
-  // Returns true |aProperty| can be run on compositor for |aFrame|.
-  static bool CanAnimatePropertyOnCompositor(const nsIFrame* aFrame,
-                                             nsCSSProperty aProperty);
+  // Returns true if this effect, applied to |aFrame|, contains
+  // properties that mean we shouldn't run *any* compositor animations on this
+  // element.
+  //
+  // For example, if we have an animation of geometric properties like 'left'
+  // and 'top' on an element, we force all 'transform' and 'opacity' animations
+  // running at the same time on the same element to run on the main thread.
+  //
+  // Similarly, some transform animations cannot be run on the compositor and
+  // when that is the case we simply disable all compositor animations
+  // on the same element.
+  //
+  // Bug 1218620 - It seems like we don't need to be this restrictive. Wouldn't
+  // it be ok to do 'opacity' animations on the compositor in either case?
+  bool ShouldBlockCompositorAnimations(const nsIFrame* aFrame) const;
+
   nsIDocument* GetRenderedDocument() const;
   nsPresContext* GetPresContext() const;
 
@@ -298,14 +312,26 @@ protected:
   virtual ~KeyframeEffectReadOnly();
   void ResetIsRunningOnCompositor();
 
+  // This effect is registered with its target element so long as:
+  //
+  // (a) It has a target element, and
+  // (b) It is "relevant" (i.e. yet to finish but not idle, or finished but
+  //     filling forwards)
+  //
+  // As a result, we need to make sure this gets called whenever anything
+  // changes with regards to this effects's timing including changes to the
+  // owning Animation's timing.
+  void UpdateTargetRegistration();
+
   static AnimationTiming ConvertKeyframeEffectOptions(
-      const Optional<double>& aOptions);
+    const UnrestrictedDoubleOrKeyframeEffectOptions& aOptions);
+
   static void BuildAnimationPropertyList(
-      JSContext* aCx,
-      Element* aTarget,
-      const Optional<JS::Handle<JSObject*>>& aFrames,
-      InfallibleTArray<AnimationProperty>& aResult,
-      ErrorResult& aRv);
+    JSContext* aCx,
+    Element* aTarget,
+    const Optional<JS::Handle<JSObject*>>& aFrames,
+    InfallibleTArray<AnimationProperty>& aResult,
+    ErrorResult& aRv);
 
   nsCOMPtr<Element> mTarget;
   RefPtr<Animation> mAnimation;

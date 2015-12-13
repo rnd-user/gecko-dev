@@ -58,6 +58,7 @@ using mozilla::Unused;
 #include "mozilla/layers/LayerManagerComposite.h"
 #include "mozilla/layers/AsyncCompositionManager.h"
 #include "mozilla/layers/APZCTreeManager.h"
+#include "mozilla/layers/APZEventState.h"
 #include "mozilla/layers/APZThreadUtils.h"
 #include "GLContext.h"
 #include "GLContextProvider.h"
@@ -78,6 +79,7 @@ using mozilla::Unused;
 #include "nsString.h"
 #include "GeckoProfiler.h" // For PROFILER_LABEL
 #include "nsIXULRuntime.h"
+#include "nsPrintfCString.h"
 
 using namespace mozilla;
 using namespace mozilla::dom;
@@ -239,6 +241,7 @@ public:
         , mIMEMaskEventsCount(1) // Mask IME events since there's no focus yet
         , mIMEUpdatingContext(false)
         , mIMESelectionChanged(false)
+        , mIMETextChangedDuringFlush(false)
     {}
 
     ~Natives();
@@ -314,11 +317,17 @@ private:
     int32_t mIMEMaskEventsCount; // Mask events when > 0
     bool mIMEUpdatingContext;
     bool mIMESelectionChanged;
+    bool mIMETextChangedDuringFlush;
 
     void SendIMEDummyKeyEvents();
     void AddIMETextChange(const IMETextChange& aChange);
-    void PostFlushIMEChanges();
-    void FlushIMEChanges();
+
+    enum FlushChangesFlag {
+        FLUSH_FLAG_NONE,
+        FLUSH_FLAG_RETRY
+    };
+    void PostFlushIMEChanges(FlushChangesFlag aFlags = FLUSH_FLAG_NONE);
+    void FlushIMEChanges(FlushChangesFlag aFlags = FLUSH_FLAG_NONE);
 
 public:
     bool NotifyIME(const IMENotification& aIMENotification);
@@ -523,10 +532,10 @@ nsWindow::IsTopLevel()
 }
 
 NS_IMETHODIMP
-nsWindow::Create(nsIWidget *aParent,
+nsWindow::Create(nsIWidget* aParent,
                  nsNativeWidget aNativeParent,
-                 const nsIntRect &aRect,
-                 nsWidgetInitData *aInitData)
+                 const LayoutDeviceIntRect& aRect,
+                 nsWidgetInitData* aInitData)
 {
     ALOG("nsWindow[%p]::Create %p [%d %d %d %d]", (void*)this, (void*)aParent, aRect.x, aRect.y, aRect.width, aRect.height);
     nsWindow *parent = (nsWindow*) aParent;
@@ -538,7 +547,7 @@ nsWindow::Create(nsIWidget *aParent,
         }
     }
 
-    mBounds = aRect;
+    mBounds = aRect.ToUnknownRect();
 
     // for toplevel windows, bounds are fixed to full screen size
     if (!parent) {
@@ -548,7 +557,8 @@ nsWindow::Create(nsIWidget *aParent,
         mBounds.height = gAndroidBounds.height;
     }
 
-    BaseCreate(nullptr, mBounds, aInitData);
+    BaseCreate(nullptr, LayoutDeviceIntRect::FromUnknownRect(mBounds),
+               aInitData);
 
     NS_ASSERTION(IsTopLevel() || parent, "non top level windowdoesn't have a parent!");
 
@@ -869,7 +879,7 @@ nsWindow::IsEnabled() const
 }
 
 NS_IMETHODIMP
-nsWindow::Invalidate(const nsIntRect &aRect)
+nsWindow::Invalidate(const LayoutDeviceIntRect& aRect)
 {
     return NS_OK;
 }
@@ -952,7 +962,7 @@ nsWindow::BringToFront()
 }
 
 NS_IMETHODIMP
-nsWindow::GetScreenBoundsUntyped(nsIntRect &aRect)
+nsWindow::GetScreenBounds(LayoutDeviceIntRect& aRect)
 {
     LayoutDeviceIntPoint p = WidgetToScreenOffset();
 
@@ -1151,6 +1161,7 @@ nsWindow::OnGlobalAndroidEvent(AndroidGeckoEvent *ae)
 
             WidgetTouchEvent touchEvent = ae->MakeTouchEvent(win);
             win->ProcessUntransformedAPZEvent(&touchEvent, ae->ApzGuid(), ae->ApzInputBlockId(), ae->ApzEventStatus());
+            win->DispatchHitTest(touchEvent);
             break;
         }
         case AndroidGeckoEvent::MOTION_EVENT: {
@@ -1259,6 +1270,11 @@ nsWindow::GetNativeData(uint32_t aDataType)
 
         case NS_NATIVE_WIDGET:
             return (void *) this;
+
+        case NS_RAW_NATIVE_IME_CONTEXT:
+            // We assume that there is only one context per process on Android
+            return NS_ONLY_ONE_NATIVE_IME_CONTEXT;
+
     }
 
     return nullptr;
@@ -1338,6 +1354,28 @@ nsWindow::OnLongTapEvent(AndroidGeckoEvent *ae)
     DispatchEvent(&event);
 }
 
+void
+nsWindow::DispatchHitTest(const WidgetTouchEvent& aEvent)
+{
+    if (aEvent.mMessage == eTouchStart && aEvent.touches.Length() == 1) {
+        // Since touch events don't get retargeted by PositionedEventTargeting.cpp
+        // code on Fennec, we dispatch a dummy mouse event that *does* get
+        // retargeted. The Fennec browser.js code can use this to activate the
+        // highlight element in case the this touchstart is the start of a tap.
+        WidgetMouseEvent hittest(true, eMouseHitTest, this,
+                                 WidgetMouseEvent::eReal);
+        hittest.refPoint = aEvent.touches[0]->mRefPoint;
+        hittest.ignoreRootScrollFrame = true;
+        hittest.inputSource = nsIDOMMouseEvent::MOZ_SOURCE_TOUCH;
+        nsEventStatus status;
+        DispatchEvent(&hittest, status);
+
+        if (mAPZEventState && hittest.hitCluster) {
+            mAPZEventState->ProcessClusterHit();
+        }
+    }
+}
+
 bool nsWindow::OnMultitouchEvent(AndroidGeckoEvent *ae)
 {
     RefPtr<nsWindow> kungFuDeathGrip(this);
@@ -1368,19 +1406,7 @@ bool nsWindow::OnMultitouchEvent(AndroidGeckoEvent *ae)
         isDownEvent = (event.mMessage == eTouchStart);
     }
 
-    if (isDownEvent && event.touches.Length() == 1) {
-        // Since touch events don't get retargeted by PositionedEventTargeting.cpp
-        // code on Fennec, we dispatch a dummy mouse event that *does* get
-        // retargeted. The Fennec browser.js code can use this to activate the
-        // highlight element in case the this touchstart is the start of a tap.
-        WidgetMouseEvent hittest(true, eMouseHitTest, this,
-                                 WidgetMouseEvent::eReal);
-        hittest.refPoint = event.touches[0]->mRefPoint;
-        hittest.ignoreRootScrollFrame = true;
-        hittest.inputSource = nsIDOMMouseEvent::MOZ_SOURCE_TOUCH;
-        nsEventStatus status;
-        DispatchEvent(&hittest, status);
-    }
+    DispatchHitTest(event);
 
     // if the last event we got was a down event, then by now we know for sure whether
     // this block has been default-prevented or not. if we haven't already sent the
@@ -1962,6 +1988,10 @@ nsWindow::Natives::AddIMETextChange(const IMETextChange& aChange)
 {
     mIMETextChanges.AppendElement(aChange);
 
+    // We may not be in the middle of flushing,
+    // in which case this flag is meaningless.
+    mIMETextChangedDuringFlush = true;
+
     // Now that we added a new range we need to go back and
     // update all the ranges before that.
     // Ranges that have offsets which follow this new range
@@ -2020,9 +2050,10 @@ nsWindow::Natives::AddIMETextChange(const IMETextChange& aChange)
 }
 
 void
-nsWindow::Natives::PostFlushIMEChanges()
+nsWindow::Natives::PostFlushIMEChanges(FlushChangesFlag aFlags)
 {
-    if (!mIMETextChanges.IsEmpty() || mIMESelectionChanged) {
+    if (aFlags != FLUSH_FLAG_RETRY &&
+            (!mIMETextChanges.IsEmpty() || mIMESelectionChanged)) {
         // Already posted
         return;
     }
@@ -2030,15 +2061,15 @@ nsWindow::Natives::PostFlushIMEChanges()
     // Keep a strong reference to the window to keep 'this' alive.
     RefPtr<nsWindow> window(&this->window);
 
-    nsAppShell::gAppShell->PostEvent([this, window] {
+    nsAppShell::gAppShell->PostEvent([this, window, aFlags] {
         if (!window->Destroyed()) {
-            FlushIMEChanges();
+            FlushIMEChanges(aFlags);
         }
     });
 }
 
 void
-nsWindow::Natives::FlushIMEChanges()
+nsWindow::Natives::FlushIMEChanges(FlushChangesFlag aFlags)
 {
     // Only send change notifications if we are *not* masking events,
     // i.e. if we have a focused editor,
@@ -2054,9 +2085,20 @@ nsWindow::Natives::FlushIMEChanges()
     RefPtr<nsWindow> kungFuDeathGrip(&window);
     window.UserActivity();
 
-    for (uint32_t i = 0; i < mIMETextChanges.Length(); i++) {
-        IMETextChange &change = mIMETextChanges[i];
+    struct TextRecord {
+        nsString text;
+        int32_t start;
+        int32_t oldEnd;
+        int32_t newEnd;
+    };
+    nsAutoTArray<TextRecord, 4> textTransaction;
+    if (mIMETextChanges.Length() > textTransaction.Capacity()) {
+        textTransaction.SetCapacity(mIMETextChanges.Length());
+    }
 
+    mIMETextChangedDuringFlush = false;
+
+    for (const IMETextChange &change : mIMETextChanges) {
         if (change.mStart == change.mOldEnd &&
                 change.mStart == change.mNewEnd) {
             continue;
@@ -2073,12 +2115,32 @@ nsWindow::Natives::FlushIMEChanges()
             NS_ENSURE_TRUE_VOID(event.mReply.mContentsRoot == imeRoot.get());
         }
 
-        mEditable->OnTextChange(event.mReply.mString, change.mStart,
-                                change.mOldEnd, change.mNewEnd);
+        if (mIMETextChangedDuringFlush) {
+            // The query event above could have triggered more text changes to
+            // come in, as indicated by our flag. If that happens, try flushing
+            // IME changes again later.
+            if (!NS_WARN_IF(aFlags == FLUSH_FLAG_RETRY)) {
+                // Don't retry if already retrying, to avoid infinite loops.
+                PostFlushIMEChanges(FLUSH_FLAG_RETRY);
+            }
+            return;
+        }
+
+        textTransaction.AppendElement(
+                TextRecord{event.mReply.mString, change.mStart,
+                           change.mOldEnd, change.mNewEnd});
     }
+
     mIMETextChanges.Clear();
 
+    for (const TextRecord& record : textTransaction) {
+        mEditable->OnTextChange(record.text, record.start,
+                                record.oldEnd, record.newEnd);
+    }
+
     if (mIMESelectionChanged) {
+        mIMESelectionChanged = false;
+
         WidgetQueryContentEvent event(true, eQuerySelectedText, &window);
         window.InitEvent(event, nullptr);
         window.DispatchEvent(&event);
@@ -2088,7 +2150,6 @@ nsWindow::Natives::FlushIMEChanges()
 
         mEditable->OnSelectionChange(int32_t(event.GetSelectionStart()),
                                      int32_t(event.GetSelectionEnd()));
-        mIMESelectionChanged = false;
     }
 }
 
@@ -2230,8 +2291,6 @@ nsWindow::Natives::GetInputContext()
 {
     InputContext context = mInputContext;
     context.mIMEState.mOpen = IMEState::OPEN_STATE_NOT_SUPPORTED;
-    // We assume that there is only one context per process on Android
-    context.mNativeIMEContext = nullptr;
     return context;
 }
 
@@ -2304,6 +2363,7 @@ nsWindow::Natives::OnImeReplaceText(int32_t aStart, int32_t aEnd,
             event.mOffset = uint32_t(aStart);
             event.mLength = uint32_t(aEnd - aStart);
             event.mExpandToClusterBoundary = false;
+            event.mReason = nsISelectionListener::IME_REASON;
             window.DispatchEvent(&event);
         }
 
@@ -2432,6 +2492,7 @@ nsWindow::Natives::OnImeUpdateComposition(int32_t aStart, int32_t aEnd)
         selEvent.mLength = std::max(aStart, aEnd) - selEvent.mOffset;
         selEvent.mReversed = aStart > aEnd;
         selEvent.mExpandToClusterBoundary = false;
+        selEvent.mReason = nsISelectionListener::IME_REASON;
 
         window.DispatchEvent(&selEvent);
         return;
@@ -2470,6 +2531,7 @@ nsWindow::Natives::OnImeUpdateComposition(int32_t aStart, int32_t aEnd)
             event.mOffset = uint32_t(aStart);
             event.mLength = uint32_t(aEnd - aStart);
             event.mExpandToClusterBoundary = false;
+            event.mReason = nsISelectionListener::IME_REASON;
             window.DispatchEvent(&event);
         }
 
@@ -2589,7 +2651,8 @@ nsWindow::GetIMEUpdatePreference()
 }
 
 void
-nsWindow::DrawWindowUnderlay(LayerManagerComposite* aManager, nsIntRect aRect)
+nsWindow::DrawWindowUnderlay(LayerManagerComposite* aManager,
+                             LayoutDeviceIntRect aRect)
 {
     GeckoLayerClient::LocalRef client = AndroidBridge::Bridge()->GetLayerClient();
     if (!client) {
@@ -2624,7 +2687,8 @@ nsWindow::DrawWindowUnderlay(LayerManagerComposite* aManager, nsIntRect aRect)
 }
 
 void
-nsWindow::DrawWindowOverlay(LayerManagerComposite* aManager, nsIntRect aRect)
+nsWindow::DrawWindowOverlay(LayerManagerComposite* aManager,
+                            LayoutDeviceIntRect aRect)
 {
     PROFILER_LABEL("nsWindow", "DrawWindowOverlay",
         js::ProfileEntry::Category::GRAPHICS);

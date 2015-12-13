@@ -2213,17 +2213,6 @@ nsGonkCameraControl::LoadRecorderProfiles()
   return NS_OK;
 }
 
-/* static */ PLDHashOperator
-nsGonkCameraControl::Enumerate(const nsAString& aProfileName,
-                               RecorderProfile* aProfile,
-                               void* aUserArg)
-{
-  nsTArray<nsString>* profiles = static_cast<nsTArray<nsString>*>(aUserArg);
-  MOZ_ASSERT(profiles);
-  profiles->AppendElement(aProfileName);
-  return PL_DHASH_NEXT;
-}
-
 nsresult
 nsGonkCameraControl::GetRecorderProfiles(nsTArray<nsString>& aProfiles)
 {
@@ -2233,7 +2222,9 @@ nsGonkCameraControl::GetRecorderProfiles(nsTArray<nsString>& aProfiles)
   }
 
   aProfiles.Clear();
-  mRecorderProfiles.EnumerateRead(Enumerate, static_cast<void*>(&aProfiles));
+  for (auto iter = mRecorderProfiles.Iter(); !iter.Done(); iter.Next()) {
+    aProfiles.AppendElement(iter.Key());
+  }
   return NS_OK;
 }
 
@@ -2388,15 +2379,11 @@ void
 nsGonkCameraControl::OnNewPreviewFrame(layers::TextureClient* aBuffer)
 {
 #ifdef MOZ_WIDGET_GONK
-  RefPtr<Image> frame = mImageContainer->CreateImage(ImageFormat::GRALLOC_PLANAR_YCBCR);
+  RefPtr<GrallocImage> frame = new GrallocImage();
 
-  GrallocImage* videoImage = static_cast<GrallocImage*>(frame.get());
-
-  GrallocImage::GrallocData data;
-  data.mGraphicBuffer = aBuffer;
-  data.mPicSize = IntSize(mCurrentConfiguration.mPreviewSize.width,
-                          mCurrentConfiguration.mPreviewSize.height);
-  videoImage->SetData(data);
+  IntSize picSize(mCurrentConfiguration.mPreviewSize.width,
+                  mCurrentConfiguration.mPreviewSize.height);
+  frame->SetData(aBuffer, picSize);
 
   if (mCapturePoster.exchange(false)) {
     CreatePoster(frame,

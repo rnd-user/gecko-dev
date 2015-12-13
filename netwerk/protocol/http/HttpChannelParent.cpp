@@ -41,7 +41,6 @@
 #include "nsIDocument.h"
 
 using mozilla::BasePrincipal;
-using mozilla::OriginAttributes;
 using namespace mozilla::dom;
 using namespace mozilla::ipc;
 
@@ -477,14 +476,7 @@ HttpChannelParent::DoAsyncOpen(  const URIParams&           aURI,
 
   if (aCorsPreflightArgs.type() == OptionalCorsPreflightArgs::TCorsPreflightArgs) {
     const CorsPreflightArgs& args = aCorsPreflightArgs.get_CorsPreflightArgs();
-    nsCOMPtr<nsIPrincipal> preflightPrincipal =
-      PrincipalInfoToPrincipal(args.preflightPrincipal());
-    rv = mChannel->SetCorsPreflightParameters(args.unsafeHeaders(),
-                                              args.withCredentials(),
-                                              preflightPrincipal);
-    if (NS_FAILED(rv)) {
-      return SendFailedAsyncOpen(rv);
-    }
+    mChannel->SetCorsPreflightParameters(args.unsafeHeaders());
   }
 
   nsCOMPtr<nsIInputStream> stream = DeserializeInputStream(uploadStream, fds);
@@ -560,11 +552,18 @@ HttpChannelParent::DoAsyncOpen(  const URIParams&           aURI,
     }
 
     if (setChooseApplicationCache) {
-      OriginAttributes attrs;
+      DocShellOriginAttributes docShellAttrs;
       if (mLoadContext) {
-        attrs.CopyFromLoadContext(mLoadContext);
+        bool result = mLoadContext->GetOriginAttributes(docShellAttrs);
+        if (!result) {
+          return SendFailedAsyncOpen(NS_ERROR_FAILURE);
+        }
       }
 
+      NeckoOriginAttributes neckoAttrs;
+      neckoAttrs.InheritFromDocShellToNecko(docShellAttrs);
+      PrincipalOriginAttributes attrs;
+      attrs.InheritFromNecko(neckoAttrs);
       nsCOMPtr<nsIPrincipal> principal =
         BasePrincipal::CreateCodebasePrincipal(uri, attrs);
 
@@ -724,7 +723,8 @@ bool
 HttpChannelParent::RecvRedirect2Verify(const nsresult& result,
                                        const RequestHeaderTuples& changedHeaders,
                                        const uint32_t& loadFlags,
-                                       const OptionalURIParams&   aAPIRedirectURI)
+                                       const OptionalURIParams& aAPIRedirectURI,
+                                       const OptionalCorsPreflightArgs& aCorsPreflightArgs)
 {
   LOG(("HttpChannelParent::RecvRedirect2Verify [this=%p result=%x]\n",
        this, result));
@@ -752,6 +752,14 @@ HttpChannelParent::RecvRedirect2Verify(const nsresult& result,
       MOZ_ASSERT(loadFlags & nsIChannel::LOAD_REPLACE);
       if (loadFlags & nsIChannel::LOAD_REPLACE) {
         newHttpChannel->SetLoadFlags(loadFlags);
+      }
+
+      if (aCorsPreflightArgs.type() == OptionalCorsPreflightArgs::TCorsPreflightArgs) {
+        nsCOMPtr<nsIHttpChannelInternal> newInternalChannel =
+          do_QueryInterface(newHttpChannel);
+        MOZ_RELEASE_ASSERT(newInternalChannel);
+        const CorsPreflightArgs& args = aCorsPreflightArgs.get_CorsPreflightArgs();
+        newInternalChannel->SetCorsPreflightParameters(args.unsafeHeaders());
       }
     }
   }
@@ -1178,6 +1186,7 @@ HttpChannelParent::OnStopRequest(nsIRequest *aRequest,
   mChannel->GetEncodedBodySize(&timing.encodedBodySize);
   // decodedBodySize can be computed in the child process so it doesn't need
   // to be passed down.
+  mChannel->GetProtocolVersion(timing.protocolVersion);
 
   if (mIPCClosed || !SendOnStopRequest(aStatusCode, timing))
     return NS_ERROR_UNEXPECTED;

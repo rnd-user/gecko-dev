@@ -93,6 +93,34 @@ ChooseValidatorCompileOptions(const ShBuiltInResources& resources,
 
 ////////////////////////////////////////
 
+static ShShaderOutput
+ShaderOutput(gl::GLContext* gl)
+{
+    if (gl->IsGLES()) {
+        return SH_ESSL_OUTPUT;
+    } else {
+        uint32_t version = gl->ShadingLanguageVersion();
+        switch (version) {
+        case 100: return SH_GLSL_COMPATIBILITY_OUTPUT;
+        case 120: return SH_GLSL_COMPATIBILITY_OUTPUT;
+        case 130: return SH_GLSL_130_OUTPUT;
+        case 140: return SH_GLSL_140_OUTPUT;
+        case 150: return SH_GLSL_150_CORE_OUTPUT;
+        case 330: return SH_GLSL_330_CORE_OUTPUT;
+        case 400: return SH_GLSL_400_CORE_OUTPUT;
+        case 410: return SH_GLSL_410_CORE_OUTPUT;
+        case 420: return SH_GLSL_420_CORE_OUTPUT;
+        case 430: return SH_GLSL_430_CORE_OUTPUT;
+        case 440: return SH_GLSL_440_CORE_OUTPUT;
+        case 450: return SH_GLSL_450_CORE_OUTPUT;
+        default:
+            MOZ_CRASH("Unexpected GLSL version.");
+        }
+    }
+
+    return SH_GLSL_OUTPUT;
+}
+
 webgl::ShaderValidator*
 WebGLContext::CreateShaderValidator(GLenum shaderType) const
 {
@@ -100,9 +128,7 @@ WebGLContext::CreateShaderValidator(GLenum shaderType) const
         return nullptr;
 
     ShShaderSpec spec = IsWebGL2() ? SH_WEBGL2_SPEC : SH_WEBGL_SPEC;
-    ShShaderOutput outputLanguage = gl->IsGLES() ? SH_ESSL_OUTPUT
-                                                 : SH_GLSL_OUTPUT;
-
+    ShShaderOutput outputLanguage = ShaderOutput(gl);
     ShBuiltInResources resources;
     memset(&resources, 0, sizeof(resources));
     ShInitBuiltInResources(&resources);
@@ -118,16 +144,16 @@ WebGLContext::CreateShaderValidator(GLenum shaderType) const
     resources.MaxFragmentUniformVectors = mGLMaxFragmentUniformVectors;
     resources.MaxDrawBuffers = mGLMaxDrawBuffers;
 
-    if (IsExtensionEnabled(WebGLExtensionID::EXT_frag_depth))
+    if (IsWebGL2() || IsExtensionEnabled(WebGLExtensionID::EXT_frag_depth))
         resources.EXT_frag_depth = 1;
 
-    if (IsExtensionEnabled(WebGLExtensionID::OES_standard_derivatives))
+    if (IsWebGL2() || IsExtensionEnabled(WebGLExtensionID::OES_standard_derivatives))
         resources.OES_standard_derivatives = 1;
 
-    if (IsExtensionEnabled(WebGLExtensionID::WEBGL_draw_buffers))
+    if (IsWebGL2() || IsExtensionEnabled(WebGLExtensionID::WEBGL_draw_buffers))
         resources.EXT_draw_buffers = 1;
 
-    if (IsExtensionEnabled(WebGLExtensionID::EXT_shader_texture_lod))
+    if (IsWebGL2() || IsExtensionEnabled(WebGLExtensionID::EXT_shader_texture_lod))
         resources.EXT_shader_texture_lod = 1;
 
     // Tell ANGLE to allow highp in frag shaders. (unless disabled)
@@ -329,6 +355,12 @@ ShaderValidator::CalcNumSamplerUniforms() const
     return accum;
 }
 
+size_t
+ShaderValidator::NumAttributes() const
+{
+  return ShGetAttributes(mHandle)->size();
+}
+
 // Attribs cannot be structs or arrays, and neither can vertex inputs in ES3.
 // Therefore, attrib names are always simple.
 bool
@@ -362,6 +394,24 @@ ShaderValidator::FindAttribMappedNameByUserName(const std::string& userName,
 }
 
 bool
+ShaderValidator::FindVaryingByMappedName(const std::string& mappedName,
+                                         std::string* const out_userName,
+                                         bool* const out_isArray) const
+{
+    const std::vector<sh::Varying>& varyings = *ShGetVaryings(mHandle);
+    for (auto itr = varyings.begin(); itr != varyings.end(); ++itr) {
+        const sh::ShaderVariable* found;
+        if (!itr->findInfoByMappedName(mappedName, &found, out_userName))
+            continue;
+
+        *out_isArray = found->isArray();
+        return true;
+    }
+
+    return false;
+}
+
+bool
 ShaderValidator::FindVaryingMappedNameByUserName(const std::string& userName,
                                                  const std::string** const out_mappedName) const
 {
@@ -375,7 +425,6 @@ ShaderValidator::FindVaryingMappedNameByUserName(const std::string& userName,
 
     return false;
 }
-
 // This must handle names like "foo.bar[0]".
 bool
 ShaderValidator::FindUniformByMappedName(const std::string& mappedName,
@@ -392,6 +441,18 @@ ShaderValidator::FindUniformByMappedName(const std::string& mappedName,
         return true;
     }
 
+    const std::vector<sh::InterfaceBlock>& interfaces = *ShGetInterfaceBlocks(mHandle);
+    for (const auto& interface : interfaces) {
+        for (const auto& field : interface.fields) {
+            const sh::ShaderVariable* found;
+
+            if (!field.findInfoByMappedName(mappedName, &found, out_userName))
+                continue;
+
+            *out_isArray = found->isArray();
+            return true;
+        }
+    }
 
     return false;
 }

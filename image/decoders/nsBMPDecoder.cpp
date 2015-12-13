@@ -162,15 +162,7 @@ Set4BitPixel(uint32_t*& aDecoded, uint8_t aData, uint32_t& aCount,
   }
 }
 
-static PRLogModuleInfo*
-GetBMPLog()
-{
-  static PRLogModuleInfo* sBMPLog;
-  if (!sBMPLog) {
-    sBMPLog = PR_NewLogModule("BMPDecoder");
-  }
-  return sBMPLog;
-}
+static mozilla::LazyLogModule sBMPLog("BMPDecoder");
 
 // The length of the mBIHSize field in the info header.
 static const uint32_t BIHSIZE_FIELD_LENGTH = 4;
@@ -239,6 +231,17 @@ nsBMPDecoder::FinishInternal()
 
   // Send notifications if appropriate.
   if (!IsMetadataDecode() && HasSize()) {
+
+    // If it was truncated, fill in the missing pixels as black.
+    while (mCurrentRow > 0) {
+      uint32_t* dst = RowBuffer();
+      while (mCurrentPos < mH.mWidth) {
+        SetPixel(dst, 0, 0, 0);
+        mCurrentPos++;
+      }
+      mCurrentPos = 0;
+      FinishRow();
+    }
 
     // Invalidate.
     nsIntRect r(0, 0, mH.mWidth, AbsoluteHeight());
@@ -426,7 +429,7 @@ nsBMPDecoder::WriteInternal(const char* aBuffer, uint32_t aCount)
   MOZ_ASSERT(aBuffer);
   MOZ_ASSERT(aCount > 0);
 
-  Maybe<State> terminalState =
+  Maybe<TerminalState> terminalState =
     mLexer.Lex(aBuffer, aCount, [=](State aState,
                                     const char* aData, size_t aLength) {
       switch (aState) {
@@ -441,23 +444,13 @@ nsBMPDecoder::WriteInternal(const char* aBuffer, uint32_t aCount)
         case State::RLE_DELTA:        return ReadRLEDelta(aData);
         case State::RLE_ABSOLUTE:     return ReadRLEAbsolute(aData, aLength);
         default:
-          MOZ_ASSERT_UNREACHABLE("Unknown State");
-          return Transition::Terminate(State::FAILURE);
+          MOZ_CRASH("Unknown State");
       }
     });
 
-  if (!terminalState) {
-    return;  // Need more data.
-  }
-
-  if (*terminalState == State::FAILURE) {
+  if (terminalState == Some(TerminalState::FAILURE)) {
     PostDataError();
-    return;
   }
-
-  MOZ_ASSERT(*terminalState == State::SUCCESS);
-
-  return;
 }
 
 LexerTransition<nsBMPDecoder::State>
@@ -468,7 +461,7 @@ nsBMPDecoder::ReadFileHeader(const char* aData, size_t aLength)
   bool signatureOk = aData[0] == 'B' && aData[1] == 'M';
   if (!signatureOk) {
     PostDataError();
-    return Transition::Terminate(State::FAILURE);
+    return Transition::TerminateFailure();
   }
 
   // We ignore the filesize (aData + 2) and reserved (aData + 6) fields.
@@ -495,7 +488,7 @@ nsBMPDecoder::ReadInfoHeaderSize(const char* aData, size_t aLength)
                     mH.mBIHSize <= InfoHeaderLength::OS2_V2_MAX);
   if (!bihSizeOk) {
     PostDataError();
-    return Transition::Terminate(State::FAILURE);
+    return Transition::TerminateFailure();
   }
   // ICO BMPs must have a WinVMPv3 header. nsICODecoder should have already
   // terminated decoding if this isn't the case.
@@ -537,7 +530,7 @@ nsBMPDecoder::ReadInfoHeaderRest(const char* aData, size_t aLength)
   }
 
   // Run with NSPR_LOG_MODULES=BMPDecoder:4 set to see this output.
-  MOZ_LOG(GetBMPLog(), LogLevel::Debug,
+  MOZ_LOG(sBMPLog, LogLevel::Debug,
           ("BMP: bihsize=%u, %d x %d, bpp=%u, compression=%u, colors=%u\n",
           mH.mBIHSize, mH.mWidth, mH.mHeight, uint32_t(mH.mBpp),
           mH.mCompression, mH.mNumColors));
@@ -550,7 +543,7 @@ nsBMPDecoder::ReadInfoHeaderRest(const char* aData, size_t aLength)
                 mH.mHeight != INT_MIN;
   if (!sizeOk) {
     PostDataError();
-    return Transition::Terminate(State::FAILURE);
+    return Transition::TerminateFailure();
   }
 
   // Check mBpp and mCompression.
@@ -564,7 +557,7 @@ nsBMPDecoder::ReadInfoHeaderRest(const char* aData, size_t aLength)
       (mH.mBpp == 16 || mH.mBpp == 32));
   if (!bppCompressionOk) {
     PostDataError();
-    return Transition::Terminate(State::FAILURE);
+    return Transition::TerminateFailure();
   }
 
   // Post our size to the superclass.
@@ -641,7 +634,7 @@ nsBMPDecoder::ReadBitfields(const char* aData, size_t aLength)
   // We've now read all the headers. If we're doing a metadata decode, we're
   // done.
   if (IsMetadataDecode()) {
-    return Transition::Terminate(State::SUCCESS);
+    return Transition::TerminateSuccess();
   }
 
   // Set up the color table, if present; it'll be filled in by ReadColorTable().
@@ -666,7 +659,7 @@ nsBMPDecoder::ReadBitfields(const char* aData, size_t aLength)
                               IntRect(IntPoint(), targetSize),
                               SurfaceFormat::B8G8R8A8);
   if (NS_FAILED(rv)) {
-    return Transition::Terminate(State::FAILURE);
+    return Transition::TerminateFailure();
   }
   MOZ_ASSERT(mImageData, "Should have a buffer now");
 
@@ -677,7 +670,7 @@ nsBMPDecoder::ReadBitfields(const char* aData, size_t aLength)
                                  mImageData, mMayHaveTransparency,
                                  /* aFlipVertically = */ true);
     if (NS_FAILED(rv)) {
-      return Transition::Terminate(State::FAILURE);
+      return Transition::TerminateFailure();
     }
   }
 
@@ -708,7 +701,7 @@ nsBMPDecoder::ReadColorTable(const char* aData, size_t aLength)
   // we give up.
   if (mPreGapLength > mH.mDataOffset) {
     PostDataError();
-    return Transition::Terminate(State::FAILURE);
+    return Transition::TerminateFailure();
   }
   uint32_t gapLength = mH.mDataOffset - mPreGapLength;
   return Transition::To(State::GAP, gapLength);
@@ -802,22 +795,50 @@ nsBMPDecoder::ReadPixelRow(const char* aData)
       if (mH.mCompression == Compression::RGB && mIsWithinICO &&
           mH.mBpp == 32) {
         // This is a special case only used for 32bpp WinBMPv3-ICO files, which
-        // could be in either 0RGB or ARGB format.
+        // could be in either 0RGB or ARGB format. We start by assuming it's
+        // an 0RGB image. If we hit a non-zero alpha value, then we know it's
+        // actually an ARGB image, and change tack accordingly.
+        // (Note: a fully-transparent ARGB image is indistinguishable from a
+        // 0RGB image, and we will render such an image as a 0RGB image, i.e.
+        // opaquely. This is unlikely to be a problem in practice.)
         while (lpos > 0) {
-          // If src[3] is zero, we can't tell at this point if the image is
-          // 0RGB or ARGB. So we just use 0 value as-is. If the image is 0RGB
-          // then mDoesHaveTransparency will be false at the end, we'll treat
-          // the image as opaque, and the 0 alpha values will be ignored. If
-          // the image is ARGB then mDoesHaveTransparency will be true at the
-          // end and we'll treat the image as non-opaque. (Note: a
-          // fully-transparent ARGB image is indistinguishable from a 0RGB
-          // image, and we will render such an image as a 0RGB image, i.e.
-          // opaquely. This is unlikely to be a problem in practice.)
-          if (src[3] != 0) {
+          if (!mDoesHaveTransparency && src[3] != 0) {
+            // Up until now this looked like an 0RGB image, but we now know
+            // it's actually an ARGB image. Which means every pixel we've seen
+            // so far has been fully transparent. So we go back and redo them.
+
+            // Tell the Downscaler to go back to the start.
+            if (mDownscaler) {
+              mDownscaler->ResetForNextProgressivePass();
+            }
+
+            // Redo the complete rows we've already done.
+            MOZ_ASSERT(mCurrentPos == 0);
+            int32_t currentRow = mCurrentRow;
+            mCurrentRow = AbsoluteHeight();
+            while (mCurrentRow > currentRow) {
+              dst = RowBuffer();
+              for (int32_t i = 0; i < mH.mWidth; i++) {
+                SetPixel(dst, 0, 0, 0, 0);
+              }
+              FinishRow();
+            }
+
+            // Redo the part of this row we've already done.
+            dst = RowBuffer();
+            int32_t n = mH.mWidth - lpos;
+            for (int32_t i = 0; i < n; i++) {
+              SetPixel(dst, 0, 0, 0, 0);
+            }
+
             MOZ_ASSERT(mMayHaveTransparency);
             mDoesHaveTransparency = true;
           }
-          SetPixel(dst, src[2], src[1], src[0], src[3]);
+
+          // If mDoesHaveTransparency is false, treat this as an 0RGB image.
+          // Otherwise, treat this as an ARGB image.
+          SetPixel(dst, src[2], src[1], src[0],
+                   mDoesHaveTransparency ? src[3] : 0xff);
           src += 4;
           --lpos;
         }
@@ -855,7 +876,7 @@ nsBMPDecoder::ReadPixelRow(const char* aData)
 
   FinishRow();
   return mCurrentRow == 0
-       ? Transition::Terminate(State::SUCCESS)
+       ? Transition::TerminateSuccess()
        : Transition::To(State::PIXEL_ROW, mPixelRowSize);
 }
 
@@ -863,7 +884,7 @@ LexerTransition<nsBMPDecoder::State>
 nsBMPDecoder::ReadRLESegment(const char* aData)
 {
   if (mCurrentRow == 0) {
-    return Transition::Terminate(State::SUCCESS);
+    return Transition::TerminateSuccess();
   }
 
   uint8_t byte1 = uint8_t(aData[0]);
@@ -898,12 +919,12 @@ nsBMPDecoder::ReadRLESegment(const char* aData)
     mCurrentPos = 0;
     FinishRow();
     return mCurrentRow == 0
-         ? Transition::Terminate(State::SUCCESS)
+         ? Transition::TerminateSuccess()
          : Transition::To(State::RLE_SEGMENT, RLE::SEGMENT_LENGTH);
   }
 
   if (byte2 == RLE::ESCAPE_EOF) {
-    return Transition::Terminate(State::SUCCESS);
+    return Transition::TerminateSuccess();
   }
 
   if (byte2 == RLE::ESCAPE_DELTA) {
@@ -961,7 +982,7 @@ nsBMPDecoder::ReadRLEDelta(const char* aData)
   }
 
   return mCurrentRow == 0
-       ? Transition::Terminate(State::SUCCESS)
+       ? Transition::TerminateSuccess()
        : Transition::To(State::RLE_SEGMENT, RLE::SEGMENT_LENGTH);
 }
 
@@ -974,7 +995,7 @@ nsBMPDecoder::ReadRLEAbsolute(const char* aData, size_t aLength)
   if (mCurrentPos + n > uint32_t(mH.mWidth)) {
     // Bad data. Stop decoding; at least part of the image may have been
     // decoded.
-    return Transition::Terminate(State::SUCCESS);
+    return Transition::TerminateSuccess();
   }
 
   // In absolute mode, n represents the number of pixels that follow, each of

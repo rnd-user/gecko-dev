@@ -10,7 +10,7 @@
 #include "jsfriendapi.h"
 
 #include "gc/Barrier.h"
-#include "js/TraceableHashTable.h"
+#include "js/GCHashTable.h"
 
 namespace js {
 
@@ -63,11 +63,19 @@ template <typename T>
 void
 TraceRoot(JSTracer* trc, T* thingp, const char* name);
 
+template <typename T>
+void
+TraceRoot(JSTracer* trc, ReadBarriered<T>* thingp, const char* name);
+
 // Idential to TraceRoot, except that this variant will not crash if |*thingp|
 // is null.
 template <typename T>
 void
 TraceNullableRoot(JSTracer* trc, T* thingp, const char* name);
+
+template <typename T>
+void
+TraceNullableRoot(JSTracer* trc, ReadBarriered<T>* thingp, const char* name);
 
 // Like TraceEdge, but for edges that do not use one of the automatic barrier
 // classes and, thus, must be treated specially for moving GC. This method is
@@ -137,29 +145,6 @@ void
 TraceCycleCollectorChildren(JS::CallbackTracer* trc, ObjectGroup* group);
 
 } // namespace gc
-
-// Define a default Policy for all pointer types. This may fail to link if this
-// policy gets used on a non-GC typed pointer by accident.
-template <typename T>
-struct DefaultGCPolicy<T*>
-{
-    static void trace(JSTracer* trc, T** t, const char* name) {
-        // If linking is failing here, it likely means that you need to define
-        // or use a non-default GC policy for your non-gc-pointer type.
-        TraceManuallyBarrieredEdge(trc, t, name);
-    }
-};
-
-// RelocatablePtr is only defined for GC pointer types, so this default policy
-// should work in all cases.
-template <typename T>
-struct DefaultGCPolicy<RelocatablePtr<T*>>
-{
-    static void trace(JSTracer* trc, RelocatablePtr<T*> t, const char* name) {
-        TraceEdge(trc, t, name);
-    }
-};
-
 } // namespace js
 
 #endif /* js_Tracer_h */

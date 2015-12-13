@@ -6,6 +6,7 @@
 
 #include "nsCOMPtr.h"
 #include "mozilla/dom/File.h"
+#include "mozilla/UniquePtr.h"
 #include "nsILocalFile.h"
 #include "Layers.h"
 #include "ImageContainer.h"
@@ -236,9 +237,7 @@ MediaEngineDefaultVideoSource::Notify(nsITimer* aTimer)
   }
 
   // Allocate a single solid color image
-  RefPtr<layers::Image> image = mImageContainer->CreateImage(ImageFormat::PLANAR_YCBCR);
-  RefPtr<layers::PlanarYCbCrImage> ycbcr_image =
-      static_cast<layers::PlanarYCbCrImage*>(image.get());
+  RefPtr<layers::PlanarYCbCrImage> ycbcr_image = mImageContainer->CreatePlanarYCbCrImage();
   layers::PlanarYCbCrData data;
   AllocateSolidColorFrame(data, mOpts.mWidth, mOpts.mHeight, 0x80, mCb, mCr);
 
@@ -316,7 +315,7 @@ public:
     // If we allow arbitrary frequencies, there's no guarantee we won't get rounded here
     // We could include an error term and adjust for it in generation; not worth the trouble
     //MOZ_ASSERT(mTotalLength * aFrequency == aSampleRate);
-    mAudioBuffer = new int16_t[mTotalLength];
+    mAudioBuffer = MakeUnique<int16_t[]>(mTotalLength);
     for (int i = 0; i < mTotalLength; i++) {
       // Set volume to -20db. It's from 32768.0 * 10^(-20/20) = 3276.8
       mAudioBuffer[i] = (3276.8f * sin(2 * M_PI * i / mTotalLength));
@@ -335,7 +334,7 @@ public:
       } else {
         processSamples = mTotalLength - mReadLength;
       }
-      memcpy(aBuffer, mAudioBuffer + mReadLength, processSamples * bytesPerSample);
+      memcpy(aBuffer, &mAudioBuffer[mReadLength], processSamples * bytesPerSample);
       aBuffer += processSamples;
       mReadLength += processSamples;
       remaining -= processSamples;
@@ -346,7 +345,7 @@ public:
   }
 
 private:
-  nsAutoArrayPtr<int16_t> mAudioBuffer;
+  UniquePtr<int16_t[]> mAudioBuffer;
   int16_t mTotalLength;
   int16_t mReadLength;
 };

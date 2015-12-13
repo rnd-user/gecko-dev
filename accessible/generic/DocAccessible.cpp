@@ -2022,6 +2022,9 @@ DocAccessible::DoARIAOwnsRelocation(Accessible* aOwner)
 {
   nsTArray<RefPtr<Accessible> >* children = mARIAOwnsHash.LookupOrAdd(aOwner);
 
+  MOZ_ASSERT(aOwner, "aOwner must be a valid pointer");
+  MOZ_ASSERT(aOwner->Elm(), "aOwner->Elm() must be a valid pointer");
+
   IDRefsIterator iter(this, aOwner->Elm(), nsGkAtoms::aria_owns);
   Accessible* child = nullptr;
 
@@ -2161,7 +2164,7 @@ void
 DocAccessible::PutChildrenBack(nsTArray<RefPtr<Accessible> >* aChildren,
                                uint32_t aStartIdx)
 {
-  nsTArray<Accessible*> containers;
+  nsTArray<RefPtr<Accessible> > containers;
   for (auto idx = aStartIdx; idx < aChildren->Length(); idx++) {
     Accessible* child = aChildren->ElementAt(idx);
 
@@ -2198,7 +2201,11 @@ DocAccessible::PutChildrenBack(nsTArray<RefPtr<Accessible> >* aChildren,
   // And put it back where it belongs to.
   aChildren->RemoveElementsAt(aStartIdx, aChildren->Length() - aStartIdx);
   for (uint32_t idx = 0; idx < containers.Length(); idx++) {
-    UpdateTreeOnInsertion(containers[idx]);
+    NS_ASSERTION(containers[idx]->IsInDocument(),
+                 "A container has been destroyed.");
+    if (containers[idx]->IsInDocument()) {
+      UpdateTreeOnInsertion(containers[idx]);
+    }
   }
 }
 

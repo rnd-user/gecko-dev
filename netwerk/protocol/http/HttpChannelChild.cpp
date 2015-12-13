@@ -860,6 +860,7 @@ HttpChannelChild::OnStopRequest(const nsresult& channelStatus,
   mRedirectEndTimeStamp = timing.redirectEnd;
   mTransferSize = timing.transferSize;
   mEncodedBodySize = timing.encodedBodySize;
+  mProtocolVersion = timing.protocolVersion;
 
   nsPerformance* documentPerformance = GetPerformance();
   if (documentPerformance) {
@@ -1536,12 +1537,14 @@ HttpChannelChild::OnRedirectVerifyCallback(nsresult result)
   RequestHeaderTuples emptyHeaders;
   RequestHeaderTuples* headerTuples = &emptyHeaders;
   nsLoadFlags loadFlags = 0;
+  OptionalCorsPreflightArgs corsPreflightArgs = mozilla::void_t();
 
   nsCOMPtr<nsIHttpChannelChild> newHttpChannelChild =
       do_QueryInterface(mRedirectChannelChild);
   if (newHttpChannelChild && NS_SUCCEEDED(result)) {
     newHttpChannelChild->AddCookiesToRequest();
     newHttpChannelChild->GetClientSetRequestHeaders(&headerTuples);
+    newHttpChannelChild->GetClientSetCorsPreflightParameters(corsPreflightArgs);
   }
 
   /* If the redirect was canceled, bypass OMR and send an empty API
@@ -1576,7 +1579,8 @@ HttpChannelChild::OnRedirectVerifyCallback(nsresult result)
   }
 
   if (mIPCOpen)
-    SendRedirect2Verify(result, *headerTuples, loadFlags, redirectURI);
+    SendRedirect2Verify(result, *headerTuples, loadFlags, redirectURI,
+                        corsPreflightArgs);
 
   return NS_OK;
 }
@@ -1678,8 +1682,11 @@ HttpChannelChild::GetSecurityInfo(nsISupports **aSecurityInfo)
 NS_IMETHODIMP
 HttpChannelChild::AsyncOpen(nsIStreamListener *listener, nsISupports *aContext)
 {
-  MOZ_ASSERT(!mLoadInfo || mLoadInfo->GetSecurityMode() == 0 ||
-             mLoadInfo->GetInitialSecurityCheckDone(),
+  MOZ_ASSERT(!mLoadInfo ||
+             mLoadInfo->GetSecurityMode() == 0 ||
+             mLoadInfo->GetInitialSecurityCheckDone() ||
+             (mLoadInfo->GetSecurityMode() == nsILoadInfo::SEC_ALLOW_CROSS_ORIGIN_DATA_IS_NULL &&
+              nsContentUtils::IsSystemPrincipal(mLoadInfo->LoadingPrincipal())),
              "security flags in loadInfo but asyncOpen2() not called");
 
   LOG(("HttpChannelChild::AsyncOpen [this=%p uri=%s]\n", this, mSpec.get()));
@@ -1842,35 +1849,11 @@ HttpChannelChild::ContinueAsyncOpen()
   }
 
   OptionalCorsPreflightArgs optionalCorsPreflightArgs;
-  if (mRequireCORSPreflight) {
-    CorsPreflightArgs args;
-    args.withCredentials() = mWithCredentials;
-    args.unsafeHeaders() = mUnsafeHeaders;
-    nsresult rv = PrincipalToPrincipalInfo(mPreflightPrincipal, &args.preflightPrincipal());
-    if (NS_WARN_IF(NS_FAILED(rv))) {
-      return rv;
-    }
-    optionalCorsPreflightArgs = args;
-  } else {
-    optionalCorsPreflightArgs = mozilla::void_t();
-  }
+  GetClientSetCorsPreflightParameters(optionalCorsPreflightArgs);
 
-  nsCOMPtr<mozIThirdPartyUtil> util(do_GetService(THIRDPARTYUTIL_CONTRACTID));
-  if (util) {
-    bool thirdParty;
-    nsresult rv = util->IsThirdPartyChannel(this, nullptr, &thirdParty);
-    if (NS_FAILED(rv)) {
-      // If we couldn't compute whether this is a third-party load, assume that
-      // it is.
-      thirdParty = true;
-    }
-
-    mThirdPartyFlags |= thirdParty ?
-      nsIHttpChannelInternal::THIRD_PARTY_PARENT_IS_THIRD_PARTY :
-      nsIHttpChannelInternal::THIRD_PARTY_PARENT_IS_SAME_PARTY;
-    nsCOMPtr<nsIURI> uri;
-    GetTopWindowURI(getter_AddRefs(uri));
-  }
+  // NB: This call forces us to cache mTopWindowURI if we haven't already.
+  nsCOMPtr<nsIURI> uri;
+  GetTopWindowURI(getter_AddRefs(uri));
 
   SerializeURI(mTopWindowURI, openArgs.topWindowURI());
 
@@ -1986,6 +1969,13 @@ HttpChannelChild::RedirectTo(nsIURI *newURI)
 {
   // disabled until/unless addons run in child or something else needs this
   return NS_ERROR_NOT_IMPLEMENTED;
+}
+
+NS_IMETHODIMP
+HttpChannelChild::GetProtocolVersion(nsACString& aProtocolVersion)
+{
+  aProtocolVersion = mProtocolVersion;
+  return NS_OK;
 }
 
 //-----------------------------------------------------------------------------
@@ -2345,6 +2335,18 @@ NS_IMETHODIMP HttpChannelChild::GetClientSetRequestHeaders(RequestHeaderTuples *
 {
   *aRequestHeaders = &mClientSetRequestHeaders;
   return NS_OK;
+}
+
+void
+HttpChannelChild::GetClientSetCorsPreflightParameters(OptionalCorsPreflightArgs& aArgs)
+{
+  if (mRequireCORSPreflight) {
+    CorsPreflightArgs args;
+    args.unsafeHeaders() = mUnsafeHeaders;
+    aArgs = args;
+  } else {
+    aArgs = mozilla::void_t();
+  }
 }
 
 NS_IMETHODIMP

@@ -62,14 +62,14 @@ MacroAssembler::implicitPop(uint32_t bytes)
 // ===============================================================
 // Stack manipulation functions.
 
-CodeOffsetLabel
+CodeOffset
 MacroAssembler::PushWithPatch(ImmWord word)
 {
     framePushed_ += sizeof(word.value);
     return pushWithPatch(word);
 }
 
-CodeOffsetLabel
+CodeOffset
 MacroAssembler::PushWithPatch(ImmPtr imm)
 {
     return PushWithPatch(ImmWord(uintptr_t(imm.value)));
@@ -79,23 +79,23 @@ MacroAssembler::PushWithPatch(ImmPtr imm)
 // Simple call functions.
 
 void
-MacroAssembler::call(const CallSiteDesc& desc, const Register reg)
+MacroAssembler::call(const wasm::CallSiteDesc& desc, const Register reg)
 {
-    CodeOffsetLabel l = call(reg);
+    CodeOffset l = call(reg);
     append(desc, l, framePushed());
 }
 
 void
-MacroAssembler::call(const CallSiteDesc& desc, Label* label)
+MacroAssembler::call(const wasm::CallSiteDesc& desc, Label* label)
 {
-    CodeOffsetLabel l = call(label);
+    CodeOffset l = call(label);
     append(desc, l, framePushed());
 }
 
 void
-MacroAssembler::call(const CallSiteDesc& desc, AsmJSInternalCallee callee)
+MacroAssembler::call(const wasm::CallSiteDesc& desc, AsmJSInternalCallee callee)
 {
-    CodeOffsetLabel l = callWithPatch();
+    CodeOffset l = callWithPatch();
     append(desc, l, framePushed(), callee.index);
 }
 
@@ -295,6 +295,13 @@ MacroAssembler::enterFakeExitFrame(enum ExitFrameTokenValues token)
 }
 
 void
+MacroAssembler::enterFakeExitFrameForNative(bool isConstructing)
+{
+    enterFakeExitFrame(isConstructing ? ConstructNativeExitFrameLayoutToken
+                                      : CallNativeExitFrameLayoutToken);
+}
+
+void
 MacroAssembler::leaveExitFrame(size_t extraFrame)
 {
     freeStack(ExitFooterFrame::Size() + extraFrame);
@@ -303,7 +310,7 @@ MacroAssembler::leaveExitFrame(size_t extraFrame)
 bool
 MacroAssembler::hasSelfReference() const
 {
-    return selfReferencePatch_.offset() != 0;
+    return selfReferencePatch_.bound();
 }
 
 //}}} check_macroassembler_style

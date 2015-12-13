@@ -225,6 +225,7 @@
 #include "mozilla/dom/ScriptSettings.h"
 #include "mozilla/dom/NavigatorBinding.h"
 #include "mozilla/dom/ImageBitmap.h"
+#include "mozilla/dom/ServiceWorkerRegistration.h"
 #ifdef HAVE_SIDEBAR
 #include "mozilla/dom/ExternalBinding.h"
 #endif
@@ -248,8 +249,6 @@ class nsIScriptTimeoutHandler;
 #include <android/log.h>
 #endif
 
-static PRLogModuleInfo* gDOMLeakPRLog;
-
 #ifdef XP_WIN
 #include <process.h>
 #define getpid _getpid
@@ -263,11 +262,13 @@ using namespace mozilla;
 using namespace mozilla::dom;
 using namespace mozilla::dom::ipc;
 using mozilla::BasePrincipal;
-using mozilla::OriginAttributes;
+using mozilla::PrincipalOriginAttributes;
 using mozilla::TimeStamp;
 using mozilla::TimeDuration;
 using mozilla::dom::cache::CacheStorage;
 using mozilla::dom::indexedDB::IDBFactory;
+
+static LazyLogModule gDOMLeakPRLog("DOMLeak");
 
 nsGlobalWindow::WindowByIdTable *nsGlobalWindow::sWindowsById = nullptr;
 bool nsGlobalWindow::sWarnedAboutWindowInternal = false;
@@ -581,6 +582,20 @@ DialogValueHolder::Get(nsIPrincipal* aSubject, nsIVariant** aResult)
   }
   result.forget(aResult);
   return NS_OK;
+}
+
+void
+DialogValueHolder::Get(JSContext* aCx, JS::Handle<JSObject*> aScope,
+                       nsIPrincipal* aSubject,
+                       JS::MutableHandle<JS::Value> aResult,
+                       mozilla::ErrorResult& aError)
+{
+  if (aSubject->Subsumes(mOrigin)) {
+    aError = nsContentUtils::XPConnect()->VariantToJS(aCx, aScope,
+                                                      mValue, aResult);
+  } else {
+    aResult.setUndefined();
+  }
 }
 
 namespace mozilla {
@@ -1278,7 +1293,6 @@ nsGlobalWindow::Init()
   NS_ASSERTION(gEntropyCollector,
                "gEntropyCollector should have been initialized!");
 
-  gDOMLeakPRLog = PR_NewLogModule("DOMLeak");
   NS_ASSERTION(gDOMLeakPRLog, "gDOMLeakPRLog should have been initialized!");
 
   sWindowsById = new WindowByIdTable();
@@ -1577,6 +1591,8 @@ nsGlobalWindow::CleanUp()
   }
 
   DisableTimeChangeNotifications();
+
+  mServiceWorkerRegistrationTable.Clear();
 }
 
 void
@@ -1789,6 +1805,8 @@ NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN_INTERNAL(nsGlobalWindow)
 
   NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mPerformance)
 
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mServiceWorkerRegistrationTable)
+
 #ifdef MOZ_WEBSPEECH
   NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mSpeechSynthesis)
 #endif
@@ -1859,6 +1877,8 @@ NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN(nsGlobalWindow)
   NS_IMPL_CYCLE_COLLECTION_UNLINK(mNavigator)
 
   NS_IMPL_CYCLE_COLLECTION_UNLINK(mPerformance)
+
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mServiceWorkerRegistrationTable)
 
 #ifdef MOZ_WEBSPEECH
   NS_IMPL_CYCLE_COLLECTION_UNLINK(mSpeechSynthesis)
@@ -3703,7 +3723,9 @@ void
 nsPIDOMWindow::RefreshMediaElements()
 {
   RefPtr<AudioChannelService> service = AudioChannelService::GetOrCreate();
-  service->RefreshAgentsVolume(GetOuterWindow());
+  if (service) {
+    service->RefreshAgentsVolume(GetOuterWindow());
+  }
 }
 
 bool
@@ -3721,7 +3743,9 @@ nsPIDOMWindow::SetAudioCapture(bool aCapture)
   mAudioCaptured = aCapture;
 
   RefPtr<AudioChannelService> service = AudioChannelService::GetOrCreate();
-  service->RefreshAgentsCapture(GetOuterWindow(), mWindowID);
+  if (service) {
+    service->RefreshAgentsCapture(GetOuterWindow(), mWindowID);
+  }
 
   return NS_OK;
 }
@@ -6134,10 +6158,12 @@ nsGlobalWindow::FinishFullscreenChange(bool aIsFullscreen)
     mWakeLock = pmService->NewWakeLock(NS_LITERAL_STRING("DOM_Fullscreen"),
                                        this, rv);
     NS_WARN_IF_FALSE(!rv.Failed(), "Failed to lock the wakelock");
+    rv.SuppressException();
   } else if (mWakeLock && !mFullScreen) {
     ErrorResult rv;
     mWakeLock->Unlock(rv);
     mWakeLock = nullptr;
+    rv.SuppressException();
   }
 }
 
@@ -7893,7 +7919,7 @@ nsGlobalWindow::PostMessageMozOuter(JSContext* aCx, JS::Handle<JS::Value> aMessa
     nsCOMPtr<nsIPrincipal> principal = nsContentUtils::SubjectPrincipal();
     MOZ_ASSERT(principal);
 
-    OriginAttributes attrs = BasePrincipal::Cast(principal)->OriginAttributesRef();
+    PrincipalOriginAttributes attrs = BasePrincipal::Cast(principal)->OriginAttributesRef();
     // Create a nsIPrincipal inheriting the app/browser attributes from the
     // caller.
     providedPrincipal = BasePrincipal::CreateCodebasePrincipal(originURI, attrs);
@@ -8126,6 +8152,7 @@ void
 nsGlobalWindow::ForceClose()
 {
   MOZ_ASSERT(IsOuterWindow());
+  MOZ_ASSERT(XRE_GetProcessType() == GeckoProcessType_Default);
 
   if (IsFrame() || !mDocShell) {
     // This may be a frame in a frameset, or a window that's already closed.
@@ -8153,6 +8180,12 @@ nsGlobalWindow::FinalClose()
 
   // Flag that we were closed.
   mIsClosed = true;
+
+  // If we get here from CloseOuter then it means that the parent process is
+  // going to close our window for us. It's just important to set mIsClosed.
+  if (XRE_GetProcessType() == GeckoProcessType_Content) {
+    return;
+  }
 
   // This stuff is non-sensical but incredibly fragile. The reasons for the
   // behavior here don't make sense today and may not have ever made sense,
@@ -10220,6 +10253,24 @@ nsGlobalWindow::GetCaches(ErrorResult& aRv)
   return ref.forget();
 }
 
+already_AddRefed<ServiceWorkerRegistrationMainThread>
+nsPIDOMWindow::GetServiceWorkerRegistration(const nsAString& aScope)
+{
+  RefPtr<ServiceWorkerRegistrationMainThread> registration;
+  if (!mServiceWorkerRegistrationTable.Get(aScope,
+                                           getter_AddRefs(registration))) {
+    registration = new ServiceWorkerRegistrationMainThread(this, aScope);
+    mServiceWorkerRegistrationTable.Put(aScope, registration);
+  }
+  return registration.forget();
+}
+
+void
+nsPIDOMWindow::InvalidateServiceWorkerRegistration(const nsAString& aScope)
+{
+  mServiceWorkerRegistrationTable.Remove(aScope);
+}
+
 void
 nsGlobalWindow::FireOfflineStatusEventIfChanged()
 {
@@ -11760,6 +11811,7 @@ nsGlobalWindow::RunTimeoutHandler(nsTimeout* aTimeout,
     ErrorResult ignored;
     JS::Rooted<JS::Value> ignoredVal(CycleCollectedJSRuntime::Get()->Runtime());
     callback->Call(me, handler->GetArgs(), &ignoredVal, ignored, reason);
+    ignored.SuppressException();
   }
 
   // We ignore any failures from calling EvaluateString() on the context or
@@ -13325,7 +13377,8 @@ nsGlobalWindow::NotifyDefaultButtonLoaded(Element& aDefaultButton,
     aError.Throw(NS_ERROR_FAILURE);
     return;
   }
-  nsIntRect buttonRect = frame->GetScreenRect();
+  LayoutDeviceIntRect buttonRect =
+    LayoutDeviceIntRect::FromUnknownRect(frame->GetScreenRect());
 
   // Get the widget rect in screen coordinates.
   nsIWidget *widget = GetNearestWidget();
@@ -13333,8 +13386,8 @@ nsGlobalWindow::NotifyDefaultButtonLoaded(Element& aDefaultButton,
     aError.Throw(NS_ERROR_FAILURE);
     return;
   }
-  nsIntRect widgetRect;
-  aError = widget->GetScreenBoundsUntyped(widgetRect);
+  LayoutDeviceIntRect widgetRect;
+  aError = widget->GetScreenBounds(widgetRect);
   if (aError.Failed()) {
     return;
   }

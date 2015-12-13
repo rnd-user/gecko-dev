@@ -1,3 +1,5 @@
+/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
+/* vim: set ts=8 sts=2 et sw=2 tw=80: */
 /* This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
@@ -9,7 +11,7 @@
 #include <stddef.h>                     // for size_t
 #include <stdint.h>                     // for uint32_t, uint64_t
 #include <sys/types.h>                  // for int32_t
-#include "mozilla/ToString.h"           // for mozilla::ToString
+#include <ostream>                      // for std::ostream
 #include "nsCoord.h"                    // for nscoord
 #include "nsError.h"                    // for nsresult
 #include "nsPoint.h"                    // for nsIntPoint, nsPoint
@@ -19,12 +21,7 @@
 #include "nsStringGlue.h"               // for nsCString
 #include "xpcom-config.h"               // for CPP_THROW_NEW
 #include "mozilla/Move.h"               // for mozilla::Move
-
-namespace mozilla {
-namespace gfx {
-class Matrix4x4;
-} // namespace gfx
-} // namespace mozilla
+#include "mozilla/gfx/MatrixFwd.h"      // for mozilla::gfx::Matrix4x4
 
 #include "pixman.h"
 
@@ -477,6 +474,11 @@ class BaseIntRegion
 {
   friend class ::nsRegion;
 
+  // Give access to all specializations of IntRegionTyped, not just ones that
+  // derive from this specialization of BaseIntRegion.
+  template <typename units>
+  friend class IntRegionTyped;
+
 public:
   typedef Rect RectType;
   typedef Point PointType;
@@ -724,6 +726,10 @@ public:
     return This();
   }
 
+  // Prefer using TransformBy(matrix, region) from UnitTransforms.h,
+  // as applying the transform should typically change the unit system.
+  // TODO(botond): Move this to IntRegionTyped and disable it for
+  //               unit != UnknownUnits.
   Derived& Transform (const mozilla::gfx::Matrix4x4 &aTransform)
   {
     mImpl.Transform(aTransform);
@@ -826,6 +832,13 @@ class IntRegionTyped :
     public BaseIntRegion<IntRegionTyped<units>, IntRectTyped<units>, IntPointTyped<units>, IntMarginTyped<units>>
 {
   typedef BaseIntRegion<IntRegionTyped<units>, IntRectTyped<units>, IntPointTyped<units>, IntMarginTyped<units>> Super;
+
+  // Make other specializations of IntRegionTyped friends.
+  template <typename OtherUnits>
+  friend class IntRegionTyped;
+
+  static_assert(IsPixel<units>::value, "'units' must be a coordinate system tag");
+
 public:
   // Forward constructors.
   IntRegionTyped() {}
@@ -844,9 +857,14 @@ public:
     return Super::operator=(mozilla::Move(aRegion));
   }
 
-  static IntRegionTyped FromUnknownRegion(const IntRegionTyped<UnknownUnits>& aRegion)
+  static IntRegionTyped FromUnknownRegion(const IntRegion& aRegion)
   {
     return IntRegionTyped(aRegion.Impl());
+  }
+  IntRegion ToUnknownRegion() const
+  {
+    // Need |this->| because Impl() is defined in a dependent base class.
+    return IntRegion(this->Impl());
   }
 private:
   // This is deliberately private, so calling code uses FromUnknownRegion().

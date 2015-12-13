@@ -1373,6 +1373,23 @@ nsProtocolProxyService::NewProxyInfo(const nsACString &aType,
                                      nsIProxyInfo *aFailoverProxy,
                                      nsIProxyInfo **aResult)
 {
+    return NewProxyInfoWithAuth(aType, aHost, aPort,
+                                EmptyCString(), EmptyCString(),
+                                aFlags, aFailoverTimeout,
+                                aFailoverProxy, aResult);
+}
+
+NS_IMETHODIMP
+nsProtocolProxyService::NewProxyInfoWithAuth(const nsACString &aType,
+                                             const nsACString &aHost,
+                                             int32_t aPort,
+                                             const nsACString &aUsername,
+                                             const nsACString &aPassword,
+                                             uint32_t aFlags,
+                                             uint32_t aFailoverTimeout,
+                                             nsIProxyInfo *aFailoverProxy,
+                                             nsIProxyInfo **aResult)
+{
     static const char *types[] = {
         kProxyType_HTTP,
         kProxyType_HTTPS,
@@ -1392,10 +1409,16 @@ nsProtocolProxyService::NewProxyInfo(const nsACString &aType,
     }
     NS_ENSURE_TRUE(type, NS_ERROR_INVALID_ARG);
 
-    if (aPort <= 0)
-        aPort = -1;
+    // We have only implemented username/password for SOCKS proxies.
+    if ((!aUsername.IsEmpty() || !aPassword.IsEmpty()) &&
+        !aType.LowerCaseEqualsASCII(kProxyType_SOCKS) &&
+        !aType.LowerCaseEqualsASCII(kProxyType_SOCKS4)) {
+        return NS_ERROR_NOT_IMPLEMENTED;
+    }
 
-    return NewProxyInfo_Internal(type, aHost, aPort, aFlags, aFailoverTimeout,
+    return NewProxyInfo_Internal(type, aHost, aPort,
+                                 aUsername, aPassword,
+                                 aFlags, aFailoverTimeout,
                                  aFailoverProxy, 0, aResult);
 }
 
@@ -1405,9 +1428,11 @@ nsProtocolProxyService::GetFailoverForProxy(nsIProxyInfo  *aProxy,
                                             nsresult       aStatus,
                                             nsIProxyInfo **aResult)
 {
-    if (mProxyConfig == PROXYCONFIG_DIRECT) {
+    // We only support failover when a PAC file is configured, either
+    // directly or via system settings
+    if (mProxyConfig != PROXYCONFIG_PAC && mProxyConfig != PROXYCONFIG_WPAD &&
+        mProxyConfig != PROXYCONFIG_SYSTEM)
         return NS_ERROR_NOT_AVAILABLE;
-    }
 
     // Verify that |aProxy| is one of our nsProxyInfo objects.
     nsCOMPtr<nsProxyInfo> pi = do_QueryInterface(aProxy);
@@ -1701,12 +1726,17 @@ nsresult
 nsProtocolProxyService::NewProxyInfo_Internal(const char *aType,
                                               const nsACString &aHost,
                                               int32_t aPort,
+                                              const nsACString &aUsername,
+                                              const nsACString &aPassword,
                                               uint32_t aFlags,
                                               uint32_t aFailoverTimeout,
                                               nsIProxyInfo *aFailoverProxy,
                                               uint32_t aResolveFlags,
                                               nsIProxyInfo **aResult)
 {
+    if (aPort <= 0)
+        aPort = -1;
+
     nsCOMPtr<nsProxyInfo> failover;
     if (aFailoverProxy) {
         failover = do_QueryInterface(aFailoverProxy);
@@ -1720,6 +1750,8 @@ nsProtocolProxyService::NewProxyInfo_Internal(const char *aType,
     proxyInfo->mType = aType;
     proxyInfo->mHost = aHost;
     proxyInfo->mPort = aPort;
+    proxyInfo->mUsername = aUsername;
+    proxyInfo->mPassword = aPassword;
     proxyInfo->mFlags = aFlags;
     proxyInfo->mResolveFlags = aResolveFlags;
     proxyInfo->mTimeout = aFailoverTimeout == UINT32_MAX
@@ -1888,8 +1920,9 @@ nsProtocolProxyService::Resolve_Internal(nsIChannel *channel,
     }
 
     if (type) {
-        rv = NewProxyInfo_Internal(type, *host, port, proxyFlags,
-                                   UINT32_MAX, nullptr, flags,
+        rv = NewProxyInfo_Internal(type, *host, port,
+                                   EmptyCString(), EmptyCString(),
+                                   proxyFlags, UINT32_MAX, nullptr, flags,
                                    result);
         if (NS_FAILED(rv))
             return rv;
@@ -2003,41 +2036,52 @@ nsProtocolProxyService::PruneProxyInfo(const nsProtocolInfo &info,
             return;
     }
 
-    // Now, scan to the next proxy not disabled. If all proxies are disabled,
-    // return blank list to enforce a DIRECT rule.
+    // Now, scan to see if all remaining proxies are disabled.  If so, then
+    // we'll just bail and return them all.  Otherwise, we'll go and prune the
+    // disabled ones.
 
     bool allDisabled = true;
+
     nsProxyInfo *iter;
-
-    // remove any disabled proxies.
-    nsProxyInfo *last = nullptr;
-    for (iter = head; iter; ) {
-        if (IsProxyDisabled(iter)) {
-            // reject!
-            nsProxyInfo *reject = iter;
-
-            iter = iter->mNext;
-            if (last)
-                last->mNext = iter;
-            else
-                head = iter;
-
-            reject->mNext = nullptr;
-            NS_RELEASE(reject);
-            continue;
+    for (iter = head; iter; iter = iter->mNext) {
+        if (!IsProxyDisabled(iter)) {
+            allDisabled = false;
+            break;
         }
-
-        allDisabled = false;
-        EnableProxy(iter);
-
-        last = iter;
-        iter = iter->mNext;
     }
 
-    if (allDisabled) {
-        LOG(("All proxies are disabled, try a DIRECT rule!"));
-        *list = nullptr;
-        return;
+    if (allDisabled)
+        LOG(("All proxies are disabled, so trying all again"));
+    else {
+        // remove any disabled proxies.
+        nsProxyInfo *last = nullptr;
+        for (iter = head; iter; ) {
+            if (IsProxyDisabled(iter)) {
+                // reject!
+                nsProxyInfo *reject = iter;
+
+                iter = iter->mNext;
+                if (last)
+                    last->mNext = iter;
+                else
+                    head = iter;
+
+                reject->mNext = nullptr;
+                NS_RELEASE(reject);
+                continue;
+            }
+
+            // since we are about to use this proxy, make sure it is not on
+            // the disabled proxy list.  we'll add it back to that list if
+            // we have to (in GetFailoverForProxy).
+            //
+            // XXX(darin): It might be better to do this as a final pass.
+            //
+            EnableProxy(iter);
+
+            last = iter;
+            iter = iter->mNext;
+        }
     }
 
     // if only DIRECT was specified then return no proxy info, and we're done.

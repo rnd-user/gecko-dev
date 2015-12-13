@@ -62,6 +62,7 @@ class nsAString;
 class nsCaret;
 namespace mozilla {
 class AccessibleCaretEventHub;
+class CSSStyleSheet;
 class TouchCaret;
 class SelectionCarets;
 } // namespace mozilla
@@ -70,7 +71,6 @@ class nsFrameManager;
 class nsILayoutHistoryState;
 class nsIReflowCallback;
 class nsIDOMNode;
-class nsIStyleSheet;
 class nsCSSFrameConstructor;
 class nsISelection;
 template<class E> class nsCOMArray;
@@ -140,10 +140,10 @@ typedef struct CapturingContentInfo {
   mozilla::StaticRefPtr<nsIContent> mContent;
 } CapturingContentInfo;
 
-// ae50e013-b2f1-4d4e-94c7-77cbcdab1c23
+// 5023beaa-0e54-4fc7-b9dc-0344dc4fb8be
 #define NS_IPRESSHELL_IID \
-{ 0xae50e013, 0xb2f1, 0x4d4e, \
-  { 0x94, 0xc7, 0x77, 0xcb, 0xcd, 0xab, 0x1c, 0x23 } }
+{ 0x5023beaa, 0x0e54, 0x4fc7, \
+  { 0xb9, 0xdc, 0x03, 0x44, 0xdc, 0x4f, 0xb8, 0xbe } }
 
 // debug VerifyReflow flags
 #define VERIFY_REFLOW_ON                    0x01
@@ -958,22 +958,24 @@ public:
   /**
    * Get the set of agent style sheets for this presentation
    */
-  virtual nsresult GetAgentStyleSheets(nsCOMArray<nsIStyleSheet>& aSheets) = 0;
+  virtual nsresult GetAgentStyleSheets(
+      nsTArray<RefPtr<mozilla::CSSStyleSheet>>& aSheets) = 0;
 
   /**
    * Replace the set of agent style sheets
    */
-  virtual nsresult SetAgentStyleSheets(const nsCOMArray<nsIStyleSheet>& aSheets) = 0;
+  virtual nsresult SetAgentStyleSheets(
+      const nsTArray<RefPtr<mozilla::CSSStyleSheet>>& aSheets) = 0;
 
   /**
    * Add an override style sheet for this presentation
    */
-  virtual nsresult AddOverrideStyleSheet(nsIStyleSheet *aSheet) = 0;
+  virtual nsresult AddOverrideStyleSheet(mozilla::CSSStyleSheet* aSheet) = 0;
 
   /**
    * Remove an override style sheet
    */
-  virtual nsresult RemoveOverrideStyleSheet(nsIStyleSheet *aSheet) = 0;
+  virtual nsresult RemoveOverrideStyleSheet(mozilla::CSSStyleSheet* aSheet) = 0;
 
   /**
    * Reconstruct frames for all elements in the document
@@ -1121,7 +1123,7 @@ public:
    * edge of the presshell area. The aPoint, aScreenRect and aFlags arguments
    * function in a similar manner as RenderSelection.
    */
-  virtual already_AddRefed<SourceSurface>
+  virtual already_AddRefed<mozilla::gfx::SourceSurface>
   RenderNode(nsIDOMNode* aNode,
              nsIntRegion* aRegion,
              nsIntPoint& aPoint,
@@ -1144,7 +1146,7 @@ public:
    * point isn't used because the position can be determined from the displayed
    * frames.
    */
-  virtual already_AddRefed<SourceSurface>
+  virtual already_AddRefed<mozilla::gfx::SourceSurface>
   RenderSelection(nsISelection* aSelection,
                   nsIntPoint& aPoint,
                   nsIntRect* aScreenRect,
@@ -1263,7 +1265,7 @@ public:
     nsCOMPtr<nsIContent> mOverrideContent;
     bool                 mReleaseContent;
     bool                 mPrimaryState;
-    
+
     explicit PointerCaptureInfo(nsIContent* aPendingContent, bool aPrimaryState) :
       mPendingContent(aPendingContent), mReleaseContent(false), mPrimaryState(aPrimaryState)
     {
@@ -1412,8 +1414,19 @@ public:
    * The resolution defaults to 1.0.
    */
   virtual nsresult SetResolution(float aResolution) = 0;
-  float GetResolution() { return mResolution; }
+  float GetResolution() { return mResolution.valueOr(1.0); }
   virtual float GetCumulativeResolution() = 0;
+
+  /**
+   * Calculate the cumulative scale resolution from this document up to
+   * but not including the root document.
+   */
+  virtual float GetCumulativeNonRootScaleResolution() = 0;
+
+  /**
+   * Was the current resolution set by the user or just default initialized?
+   */
+  bool IsResolutionSet() { return mResolution.isSome(); }
 
   /**
    * Similar to SetResolution() but also increases the scale of the content
@@ -1728,7 +1741,7 @@ protected:
 
   // Used to force allocation and rendering of proportionally more or
   // less pixels in both dimensions.
-  float                     mResolution;
+  mozilla::Maybe<float>     mResolution;
 
   int16_t                   mSelectionFlags;
 

@@ -62,9 +62,9 @@ namespace jit {
     _(GetArgumentsObjectArg)                                                \
     _(SetArgumentsObjectArg)                                                \
     _(ComputeThis)                                                          \
-    _(LoadArrowThis)                                                        \
     _(Call)                                                                 \
     _(ApplyArgs)                                                            \
+    _(ApplyArray)                                                           \
     _(ArraySplice)                                                          \
     _(Bail)                                                                 \
     _(Unreachable)                                                          \
@@ -162,6 +162,7 @@ namespace jit {
     _(GetPropertyPolymorphic)                                               \
     _(SetPropertyPolymorphic)                                               \
     _(BindNameCache)                                                        \
+    _(CallBindVar)                                                          \
     _(GuardShape)                                                           \
     _(GuardReceiverPolymorphic)                                             \
     _(GuardObjectGroup)                                                     \
@@ -208,12 +209,14 @@ namespace jit {
     _(StoreTypedArrayElementHole)                                           \
     _(StoreTypedArrayElementStatic)                                         \
     _(AtomicIsLockFree)                                                     \
+    _(GuardSharedTypedArray)                                                \
     _(CompareExchangeTypedArrayElement)                                     \
     _(AtomicExchangeTypedArrayElement)                                      \
     _(AtomicTypedArrayElementBinop)                                         \
     _(EffectiveAddress)                                                     \
     _(ClampToUint8)                                                         \
     _(LoadFixedSlot)                                                        \
+    _(LoadFixedSlotAndUnbox)                                                \
     _(StoreFixedSlot)                                                       \
     _(CallGetProperty)                                                      \
     _(GetNameCache)                                                         \
@@ -276,7 +279,8 @@ namespace jit {
     _(Debugger)                                                             \
     _(NewTarget)                                                            \
     _(ArrowNewTarget)                                                       \
-    _(CheckReturn)
+    _(CheckReturn)                                                          \
+    _(CheckObjCoercible)
 
 // Forward declarations of MIR types.
 #define FORWARD_DECLARE(op) class M##op;

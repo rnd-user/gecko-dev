@@ -17,7 +17,7 @@ function get_request_init(base, params) {
   init['method'] = params['method'] || base['method'];
   init['mode'] = params['mode'] || base['mode'];
   init['credentials'] = params['credentials'] || base['credentials'];
-  init['redirect'] = params['redirect'] || base['redirect'];
+  init['redirect'] = params['redirect-mode'] || base['redirect'];
   return init;
 }
 
@@ -27,6 +27,9 @@ self.addEventListener('fetch', function(event) {
     var url = params['url'];
     if (params['ignore']) {
       return;
+    }
+    if (params['throw']) {
+      throw new Error('boom');
     }
     if (params['reject']) {
       event.respondWith(new Promise(function(resolve, reject) {

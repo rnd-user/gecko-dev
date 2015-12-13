@@ -99,7 +99,6 @@ HttpBaseChannel::HttpBaseChannel()
   , mDecodedBodySize(0)
   , mEncodedBodySize(0)
   , mRequireCORSPreflight(false)
-  , mWithCredentials(false)
   , mReportCollector(new ConsoleReportCollector())
   , mForceMainDocumentChannel(false)
 {
@@ -1885,8 +1884,10 @@ class CookieNotifierRunnable : public nsRunnable
 {
 public:
   CookieNotifierRunnable(HttpBaseChannel* aChannel, char const * aCookie)
-    : mChannel(aChannel), mCookie(aCookie)
-  { }
+    : mChannel(aChannel)
+  {
+    CopyASCIItoUTF16(aCookie, mCookie);
+  }
 
   NS_IMETHOD Run()
   {
@@ -1901,7 +1902,7 @@ public:
 
 private:
   RefPtr<HttpBaseChannel> mChannel;
-  NS_ConvertASCIItoUTF16 mCookie;
+  nsString mCookie;
 };
 
 } // namespace
@@ -2530,15 +2531,6 @@ HttpBaseChannel::AddCookiesToRequest()
   SetRequestHeader(nsDependentCString(nsHttp::Cookie), cookie, false);
 }
 
-static PLDHashOperator
-CopyProperties(const nsAString& aKey, nsIVariant *aData, void *aClosure)
-{
-  nsIWritablePropertyBag* bag = static_cast<nsIWritablePropertyBag*>
-                                           (aClosure);
-  bag->SetProperty(aKey, aData);
-  return PL_DHASH_NEXT;
-}
-
 bool
 HttpBaseChannel::ShouldRewriteRedirectToGET(uint32_t httpStatus,
                                             nsHttpRequestHead::ParsedMethodType method)
@@ -2617,11 +2609,7 @@ HttpBaseChannel::SetupReplacementChannel(nsIURI       *newURI,
   // Preserve the CORS preflight information.
   nsCOMPtr<nsIHttpChannelInternal> httpInternal = do_QueryInterface(newChannel);
   if (mRequireCORSPreflight && httpInternal) {
-    rv = httpInternal->SetCorsPreflightParameters(mUnsafeHeaders, mWithCredentials,
-                                                  mPreflightPrincipal);
-    if (NS_WARN_IF(NS_FAILED(rv))) {
-      return rv;
-    }
+    httpInternal->SetCorsPreflightParameters(mUnsafeHeaders);
   }
 
   if (preserveMethod) {
@@ -2734,8 +2722,11 @@ HttpBaseChannel::SetupReplacementChannel(nsIURI       *newURI,
 
   // transfer any properties
   nsCOMPtr<nsIWritablePropertyBag> bag(do_QueryInterface(newChannel));
-  if (bag)
-    mPropertyHash.EnumerateRead(CopyProperties, bag.get());
+  if (bag) {
+    for (auto iter = mPropertyHash.Iter(); !iter.Done(); iter.Next()) {
+      bag->SetProperty(iter.Key(), iter.UserData());
+    }
+  }
 
   // Transfer the timing data (if we are dealing with an nsITimedChannel).
   nsCOMPtr<nsITimedChannel> newTimedChannel(do_QueryInterface(newChannel));
@@ -3111,18 +3102,13 @@ HttpBaseChannel::EnsureSchedulingContextID()
     return true;
 }
 
-NS_IMETHODIMP
-HttpBaseChannel::SetCorsPreflightParameters(const nsTArray<nsCString>& aUnsafeHeaders,
-                                            bool aWithCredentials,
-                                            nsIPrincipal* aPrincipal)
+void
+HttpBaseChannel::SetCorsPreflightParameters(const nsTArray<nsCString>& aUnsafeHeaders)
 {
-  ENSURE_CALLED_BEFORE_CONNECT();
+  MOZ_RELEASE_ASSERT(!mRequestObserversCalled);
 
   mRequireCORSPreflight = true;
   mUnsafeHeaders = aUnsafeHeaders;
-  mWithCredentials = aWithCredentials;
-  mPreflightPrincipal = aPrincipal;
-  return NS_OK;
 }
 
 } // namespace net

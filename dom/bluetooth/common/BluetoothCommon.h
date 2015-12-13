@@ -263,7 +263,7 @@ extern bool gBluetoothDebugFlag;
 #define MAP_MESSAGES_LISTING_REQ_ID          "mapmessageslistingreq"
 #define MAP_GET_MESSAGE_REQ_ID               "mapgetmessagereq"
 #define MAP_SET_MESSAGE_STATUS_REQ_ID        "mapsetmessagestatusreq"
-#define MAP_PUSH_MESSAGE_REQ_ID              "mappushmessagereq"
+#define MAP_SEND_MESSAGE_REQ_ID              "mapsendmessagereq"
 #define MAP_FOLDER_LISTING_REQ_ID            "mapfolderlistingreq"
 #define MAP_MESSAGE_UPDATE_REQ_ID            "mapmessageupdatereq"
 
@@ -320,6 +320,7 @@ enum BluetoothStatus {
   STATUS_UNHANDLED,
   STATUS_AUTH_FAILURE,
   STATUS_RMT_DEV_DOWN,
+  STATUS_AUTH_REJECTED,
   NUM_STATUS
 };
 
@@ -674,6 +675,24 @@ struct BluetoothUuid {
 struct BluetoothPinCode {
   uint8_t mPinCode[16]; /* not \0-terminated */
   uint8_t mLength;
+
+  BluetoothPinCode()
+    : mLength(0)
+  {
+    std::fill(mPinCode, mPinCode + MOZ_ARRAY_LENGTH(mPinCode), 0);
+  }
+
+  bool operator==(const BluetoothPinCode& aRhs) const
+  {
+    MOZ_ASSERT(mLength <= MOZ_ARRAY_LENGTH(mPinCode));
+    return (mLength == aRhs.mLength) &&
+            std::equal(aRhs.mPinCode, aRhs.mPinCode + aRhs.mLength, mPinCode);
+  }
+
+  bool operator!=(const BluetoothPinCode& aRhs) const
+  {
+    return !operator==(aRhs);
+  }
 };
 
 struct BluetoothServiceName {

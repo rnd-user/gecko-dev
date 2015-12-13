@@ -22,6 +22,7 @@ struct ANPEvent;
 namespace mozilla {
     class AndroidGeckoEvent;
     class TextComposition;
+    class WidgetTouchEvent;
 
     namespace layers {
         class CompositorParent;
@@ -63,16 +64,16 @@ public:
     void OnSizeChanged(const mozilla::gfx::IntSize& aSize);
 
     void InitEvent(mozilla::WidgetGUIEvent& event,
-                   mozilla::LayoutDeviceIntPoint* aPoint = 0);
+                   LayoutDeviceIntPoint* aPoint = 0);
 
     //
     // nsIWidget
     //
 
-    NS_IMETHOD Create(nsIWidget *aParent,
+    NS_IMETHOD Create(nsIWidget* aParent,
                       nsNativeWidget aNativeParent,
-                      const nsIntRect &aRect,
-                      nsWidgetInitData *aInitData) override;
+                      const LayoutDeviceIntRect& aRect,
+                      nsWidgetInitData* aInitData) override;
     NS_IMETHOD Destroy(void) override;
     NS_IMETHOD ConfigureChildren(const nsTArray<nsIWidget::Configuration>&) override;
     NS_IMETHOD SetParent(nsIWidget* aNewParent) override;
@@ -102,10 +103,10 @@ public:
     NS_IMETHOD SetSizeMode(nsSizeMode aMode) override;
     NS_IMETHOD Enable(bool aState) override;
     virtual bool IsEnabled() const override;
-    NS_IMETHOD Invalidate(const nsIntRect &aRect) override;
+    NS_IMETHOD Invalidate(const LayoutDeviceIntRect& aRect) override;
     NS_IMETHOD SetFocus(bool aRaise = false) override;
-    NS_IMETHOD GetScreenBoundsUntyped(nsIntRect &aRect) override;
-    virtual mozilla::LayoutDeviceIntPoint WidgetToScreenOffset() override;
+    NS_IMETHOD GetScreenBounds(LayoutDeviceIntRect& aRect) override;
+    virtual LayoutDeviceIntPoint WidgetToScreenOffset() override;
     NS_IMETHOD DispatchEvent(mozilla::WidgetGUIEvent* aEvent,
                              nsEventStatus& aStatus) override;
     nsEventStatus DispatchEvent(mozilla::WidgetGUIEvent* aEvent);
@@ -150,8 +151,8 @@ public:
     NS_IMETHOD ReparentNativeWidget(nsIWidget* aNewParent) override;
 
     virtual bool NeedsPaint() override;
-    virtual void DrawWindowUnderlay(LayerManagerComposite* aManager, nsIntRect aRect) override;
-    virtual void DrawWindowOverlay(LayerManagerComposite* aManager, nsIntRect aRect) override;
+    virtual void DrawWindowUnderlay(LayerManagerComposite* aManager, LayoutDeviceIntRect aRect) override;
+    virtual void DrawWindowOverlay(LayerManagerComposite* aManager, LayoutDeviceIntRect aRect) override;
 
     virtual mozilla::layers::CompositorParent* NewCompositorParent(int aSurfaceWidth, int aSurfaceHeight) override;
 
@@ -187,6 +188,7 @@ protected:
 
     void ConfigureAPZCTreeManager() override;
     void ConfigureAPZControllerThread() override;
+    void DispatchHitTest(const mozilla::WidgetTouchEvent& aEvent);
 
     already_AddRefed<GeckoContentController> CreateRootContentController() override;
 

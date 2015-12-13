@@ -50,9 +50,6 @@ with Files('../public/TrackedOptimizationInfo.h'):
     BUG_COMPONENT = component_jit
 
 
-if CONFIG['DEHYDRA_PATH']:
-    DIRS += ['analysis-tests']
-
 if CONFIG['JS_BUNDLED_EDITLINE']:
     DIRS += ['editline']
 
@@ -111,6 +108,7 @@ EXPORTS.js += [
     '../public/Date.h',
     '../public/Debug.h',
     '../public/GCAPI.h',
+    '../public/GCHashTable.h',
     '../public/HashTable.h',
     '../public/HeapAPI.h',
     '../public/Id.h',
@@ -125,7 +123,6 @@ EXPORTS.js += [
     '../public/RootingAPI.h',
     '../public/SliceBudget.h',
     '../public/StructuredClone.h',
-    '../public/TraceableHashTable.h',
     '../public/TraceableVector.h',
     '../public/TraceKind.h',
     '../public/TracingAPI.h',
@@ -134,6 +131,7 @@ EXPORTS.js += [
     '../public/UbiNode.h',
     '../public/UbiNodeBreadthFirst.h',
     '../public/UbiNodeCensus.h',
+    '../public/UbiNodeDominatorTree.h',
     '../public/UbiNodePostOrder.h',
     '../public/Utility.h',
     '../public/Value.h',
@@ -142,12 +140,14 @@ EXPORTS.js += [
 ]
 
 UNIFIED_SOURCES += [
-    'asmjs/AsmJSCompile.cpp',
     'asmjs/AsmJSFrameIterator.cpp',
     'asmjs/AsmJSLink.cpp',
     'asmjs/AsmJSModule.cpp',
     'asmjs/AsmJSSignalHandlers.cpp',
     'asmjs/AsmJSValidate.cpp',
+    'asmjs/WasmGenerator.cpp',
+    'asmjs/WasmIonCompile.cpp',
+    'asmjs/WasmStubs.cpp',
     'builtin/AtomicsObject.cpp',
     'builtin/Eval.cpp',
     'builtin/Intl.cpp',
@@ -321,7 +321,6 @@ UNIFIED_SOURCES += [
     'vm/SelfHosting.cpp',
     'vm/Shape.cpp',
     'vm/SharedArrayObject.cpp',
-    'vm/SharedTypedArrayObject.cpp',
     'vm/SPSProfiler.cpp',
     'vm/Stack.cpp',
     'vm/Stopwatch.cpp',
@@ -477,6 +476,7 @@ elif CONFIG['JS_CODEGEN_ARM64']:
     if CONFIG['JS_SIMULATOR_ARM64']:
         UNIFIED_SOURCES += [
             'jit/arm64/vixl/Debugger-vixl.cpp',
+            'jit/arm64/vixl/Logic-vixl.cpp',
             'jit/arm64/vixl/MozSimulator-vixl.cpp',
             'jit/arm64/vixl/Simulator-vixl.cpp'
         ]
@@ -641,6 +641,8 @@ if CONFIG['_MSC_VER']:
     # Parser<SyntaxParseHandler> definition, see bug 1167030.
     CXXFLAGS += ['-wd4661']
     CXXFLAGS += ['-we4067', '-we4258', '-we4275']
+    CXXFLAGS += ['-wd4146'] # FIXME: unary minus operator applied to unsigned type (bug 1229189)
+    CXXFLAGS += ['-wd4273'] # FIXME: inconsistent dll linkage (bug 1229666)
 
 if CONFIG['OS_ARCH'] not in ('WINNT', 'HP-UX'):
     OS_LIBS += [
@@ -667,9 +669,7 @@ if CONFIG['OS_ARCH'] == 'SunOS':
 
 CFLAGS += CONFIG['MOZ_ICU_CFLAGS']
 CXXFLAGS += CONFIG['MOZ_ICU_CFLAGS']
-
-if not CONFIG['GNU_CXX']:
-    ALLOW_COMPILER_WARNINGS = True
+LOCAL_INCLUDES += CONFIG['MOZ_ICU_INCLUDES']
 
 NO_EXPAND_LIBS = True
 
@@ -703,3 +703,10 @@ selfhosted.inputs = [
     'builtin/TypedObject.js',
     'builtin/WeakSet.js'
 ]
+
+if CONFIG['JS_HAS_CTYPES']:
+    if CONFIG['MOZ_NATIVE_FFI']:
+        CXXFLAGS += CONFIG['MOZ_FFI_CFLAGS']
+    else:
+        # Windows needs this to be linked with a static library.
+        DEFINES['FFI_BUILDING'] = True

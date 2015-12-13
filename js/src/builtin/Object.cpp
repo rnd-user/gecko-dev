@@ -33,7 +33,12 @@ js::obj_construct(JSContext* cx, unsigned argc, Value* vp)
     CallArgs args = CallArgsFromVp(argc, vp);
 
     RootedObject obj(cx, nullptr);
-    if (args.length() > 0 && !args[0].isNullOrUndefined()) {
+    if (args.isConstructing() && (&args.newTarget().toObject() != &args.callee())) {
+        RootedObject newTarget(cx, &args.newTarget().toObject());
+        obj = CreateThis(cx, &PlainObject::class_, newTarget);
+        if (!obj)
+            return false;
+    } else if (args.length() > 0 && !args[0].isNullOrUndefined()) {
         obj = ToObject(cx, args[0]);
         if (!obj)
             return false;
@@ -1004,6 +1009,10 @@ static const JSFunctionSpec object_static_methods[] = {
     JS_FN("setPrototypeOf",            obj_setPrototypeOf,          2, 0),
     JS_FN("getOwnPropertyDescriptor",  obj_getOwnPropertyDescriptor,2, 0),
     JS_FN("keys",                      obj_keys,                    1, 0),
+#ifndef RELEASE_BUILD
+    JS_SELF_HOSTED_FN("values",        "ObjectValues",              1, JSPROP_DEFINE_LATE),
+    JS_SELF_HOSTED_FN("entries",       "ObjectEntries",             1, JSPROP_DEFINE_LATE),
+#endif
     JS_FN("is",                        obj_is,                      2, 0),
     JS_FN("defineProperty",            obj_defineProperty,          3, 0),
     JS_FN("defineProperties",          obj_defineProperties,        2, 0),

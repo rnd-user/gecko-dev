@@ -1521,6 +1521,24 @@ nsPresContext::GetDefaultFont(uint8_t aFontID, nsIAtom *aLanguage) const
   return font;
 }
 
+already_AddRefed<nsIAtom>
+nsPresContext::GetContentLanguage() const
+{
+  nsAutoString language;
+  Document()->GetContentLanguage(language);
+  language.StripWhitespace();
+
+  // Content-Language may be a comma-separated list of language codes,
+  // in which case the HTML5 spec says to treat it as unknown
+  if (!language.IsEmpty() &&
+      !language.Contains(char16_t(','))) {
+    return do_GetAtom(language);
+    // NOTE:  This does *not* count as an explicit language; in other
+    // words, it doesn't trigger language-specific hyphenation.
+  }
+  return nullptr;
+}
+
 void
 nsPresContext::SetFullZoom(float aZoom)
 {
@@ -1615,6 +1633,11 @@ GetPropagatedScrollbarStylesForViewport(nsPresContext* aPresContext,
 
   nsIDocument* document = aPresContext->Document();
   Element* docElement = document->GetRootElement();
+
+  // docElement might be null if we're doing this after removing it.
+  if (!docElement) {
+    return nullptr;
+  }
 
   // Check the style on the document root element
   nsStyleSet *styleSet = aPresContext->StyleSet();
@@ -2525,7 +2548,7 @@ nsPresContext::NotifySubDocInvalidation(ContainerLayer* aContainer,
     return;
   }
 
-  nsIntPoint topLeft = aContainer->GetVisibleRegion().GetBounds().TopLeft();
+  nsIntPoint topLeft = aContainer->GetVisibleRegion().ToUnknownRegion().GetBounds().TopLeft();
 
   nsIntRegionRectIterator iter(aRegion);
   while (const nsIntRect* r = iter.Next()) {
@@ -2853,11 +2876,10 @@ nsPresContext::GetPrimaryFrameFor(nsIContent* aContent)
   return nullptr;
 }
 
-
 size_t
 nsPresContext::SizeOfExcludingThis(MallocSizeOf aMallocSizeOf) const
 {
-  return mPropertyTable.SizeOfExcludingThis(aMallocSizeOf);
+  return mPropertyTable.SizeOfExcludingThis(aMallocSizeOf) +
          mLangGroupFontPrefs.SizeOfExcludingThis(aMallocSizeOf);
 
   // Measurement of other members may be added later if DMD finds it is
@@ -3081,14 +3103,17 @@ nsRootPresContext::CancelApplyPluginGeometryTimer()
 #ifndef XP_MACOSX
 
 static bool
-HasOverlap(const nsIntPoint& aOffset1, const nsTArray<nsIntRect>& aClipRects1,
-           const nsIntPoint& aOffset2, const nsTArray<nsIntRect>& aClipRects2)
+HasOverlap(const LayoutDeviceIntPoint& aOffset1,
+           const nsTArray<LayoutDeviceIntRect>& aClipRects1,
+           const LayoutDeviceIntPoint& aOffset2,
+           const nsTArray<LayoutDeviceIntRect>& aClipRects2)
 {
-  nsIntPoint offsetDelta = aOffset1 - aOffset2;
+  LayoutDeviceIntPoint offsetDelta = aOffset1 - aOffset2;
   for (uint32_t i = 0; i < aClipRects1.Length(); ++i) {
     for (uint32_t j = 0; j < aClipRects2.Length(); ++j) {
-      if ((aClipRects1[i] + offsetDelta).Intersects(aClipRects2[j]))
+      if ((aClipRects1[i] + offsetDelta).Intersects(aClipRects2[j])) {
         return true;
+      }
     }
   }
   return false;
@@ -3127,9 +3152,9 @@ SortConfigurations(nsTArray<nsIWidget::Configuration>* aConfigurations)
       for (uint32_t j = 0; j < pluginsToMove.Length(); ++j) {
         if (i == j)
           continue;
-        nsIntRect bounds;
-        pluginsToMove[j].mChild->GetBoundsUntyped(bounds);
-        nsAutoTArray<nsIntRect,1> clipRects;
+        LayoutDeviceIntRect bounds;
+        pluginsToMove[j].mChild->GetBounds(bounds);
+        nsAutoTArray<LayoutDeviceIntRect,1> clipRects;
         pluginsToMove[j].mChild->GetWindowClipRegion(&clipRects);
         if (HasOverlap(bounds.TopLeft(), clipRects,
                        config->mBounds.TopLeft(),
@@ -3207,6 +3232,12 @@ nsRootPresContext::CollectPluginGeometryUpdates(LayerManager* aLayerManager)
   mozilla::layers::ClientLayerManager* clm = aLayerManager->AsClientLayerManager();
 
   nsTArray<nsIWidget::Configuration> configurations;
+  // If there aren't any plugins to configure, clear the plugin data cache
+  // in the layer system.
+  if (!mRegisteredPlugins.Count() && clm) {
+    clm->StorePluginWidgetConfigurations(configurations);
+    return;
+  }
   PluginGetGeometryUpdate(mRegisteredPlugins, &configurations);
   if (configurations.IsEmpty()) {
     PluginDidSetGeometry(mRegisteredPlugins);

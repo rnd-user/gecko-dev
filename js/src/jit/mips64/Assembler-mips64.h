@@ -126,7 +126,7 @@ class Assembler : public AssemblerMIPSShared
     using AssemblerMIPSShared::bind;
 
     void bind(RepatchLabel* label);
-    void Bind(uint8_t* rawCode, AbsoluteLabel* label, const void* address);
+    void Bind(uint8_t* rawCode, CodeOffset* label, const void* address);
 
     static void TraceJumpRelocations(JSTracer* trc, JitCode* code, CompactBufferReader& reader);
     static void TraceDataRelocations(JSTracer* trc, JitCode* code, CompactBufferReader& reader);
@@ -151,11 +151,11 @@ class Assembler : public AssemblerMIPSShared
                                         PatchedImmPtr expectedValue);
 
     static void PatchInstructionImmediate(uint8_t* code, PatchedImmPtr imm);
+    static uint64_t ExtractInstructionImmediate(uint8_t* code);
 
     static void ToggleCall(CodeLocationLabel inst_, bool enabled);
 
     static void UpdateBoundsCheck(uint64_t logHeapSize, Instruction* inst);
-    static int64_t ExtractCodeLabelOffset(uint8_t* code);
 }; // Assembler
 
 static const uint32_t NumIntArgRegs = 8;

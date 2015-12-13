@@ -594,6 +594,7 @@ GK_ATOM(menuseparator, "menuseparator")
 GK_ATOM(message, "message")
 GK_ATOM(meta, "meta")
 GK_ATOM(referrer, "referrer")
+GK_ATOM(referrerpolicy, "referrerpolicy")
 GK_ATOM(meter, "meter")
 GK_ATOM(method, "method")
 GK_ATOM(microdataProperties, "microdataProperties")
@@ -910,6 +911,7 @@ GK_ATOM(onstatechange, "onstatechange")
 GK_ATOM(onstatuschanged, "onstatuschanged")
 GK_ATOM(onstkcommand, "onstkcommand")
 GK_ATOM(onstksessionend, "onstksessionend")
+GK_ATOM(onstorage, "onstorage")
 GK_ATOM(onstorageareachanged, "onstorageareachanged")
 GK_ATOM(onsubmit, "onsubmit")
 GK_ATOM(onsuccess, "onsuccess")
@@ -2098,6 +2100,9 @@ GK_ATOM(ongamepaddisconnected, "ongamepaddisconnected")
 GK_ATOM(animationsProperty, "AnimationsProperty")        // FrameAnimations*
 GK_ATOM(animationsOfBeforeProperty, "AnimationsOfBeforeProperty") // FrameAnimations*
 GK_ATOM(animationsOfAfterProperty, "AnimationsOfAfterProperty") // FrameAnimations*
+GK_ATOM(animationEffectsProperty, "AnimationEffectsProperty") // EffectSet*
+GK_ATOM(animationEffectsForBeforeProperty, "AnimationsEffectsForBeforeProperty") // EffectSet*
+GK_ATOM(animationEffectsForAfterProperty, "AnimationsEffectsForAfterProperty") // EffectSet*
 GK_ATOM(transitionsProperty, "TransitionsProperty")        // FrameTransitions*
 GK_ATOM(transitionsOfBeforeProperty, "TransitionsOfBeforeProperty") // FrameTransitions*
 GK_ATOM(transitionsOfAfterProperty, "TransitionsOfAfterProperty") // FrameTransitions*
@@ -2400,3 +2405,6 @@ GK_ATOM(onboundary, "onboundary")
 #endif
 
 GK_ATOM(vr_state, "vr-state")
+
+// Contextual Identity / Containers
+GK_ATOM(usercontextid, "usercontextid")

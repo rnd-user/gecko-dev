@@ -2391,13 +2391,15 @@ public:
         typedef void ReturnType;
         typedef void SetterType;
         typedef mozilla::jni::Args<
+                int32_t,
                 mozilla::jni::String::Param,
                 mozilla::jni::String::Param,
                 int32_t,
+                int64_t,
                 int64_t> Args;
         static constexpr char name[] = "notifySmsReceived";
         static constexpr char signature[] =
-                "(Ljava/lang/String;Ljava/lang/String;IJ)V";
+                "(ILjava/lang/String;Ljava/lang/String;IJJ)V";
         static const bool isStatic = true;
         static const bool isMultithreaded = false;
         static const mozilla::jni::ExceptionMode exceptionMode =
@@ -3044,23 +3046,23 @@ public:
     template<class Impl> class Natives;
 };
 
-class RestrictedProfiles : public mozilla::jni::Class<RestrictedProfiles>
+class Restrictions : public mozilla::jni::Class<Restrictions>
 {
 public:
-    typedef mozilla::jni::Ref<RestrictedProfiles> Ref;
-    typedef mozilla::jni::LocalRef<RestrictedProfiles> LocalRef;
-    typedef mozilla::jni::GlobalRef<RestrictedProfiles> GlobalRef;
-    typedef const mozilla::jni::Param<RestrictedProfiles>& Param;
+    typedef mozilla::jni::Ref<Restrictions> Ref;
+    typedef mozilla::jni::LocalRef<Restrictions> LocalRef;
+    typedef mozilla::jni::GlobalRef<Restrictions> GlobalRef;
+    typedef const mozilla::jni::Param<Restrictions>& Param;
 
     static constexpr char name[] =
-            "org/mozilla/gecko/RestrictedProfiles";
+            "org/mozilla/gecko/Restrictions";
 
 protected:
-    RestrictedProfiles(jobject instance) : Class(instance) {}
+    Restrictions(jobject instance) : Class(instance) {}
 
 public:
     struct IsAllowed_t {
-        typedef RestrictedProfiles Owner;
+        typedef Restrictions Owner;
         typedef bool ReturnType;
         typedef bool SetterType;
         typedef mozilla::jni::Args<
@@ -3079,7 +3081,7 @@ public:
 
 public:
     struct IsUserRestricted_t {
-        typedef RestrictedProfiles Owner;
+        typedef Restrictions Owner;
         typedef bool ReturnType;
         typedef bool SetterType;
         typedef mozilla::jni::Args<> Args;

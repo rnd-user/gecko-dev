@@ -12,7 +12,7 @@
 #include "nsAutoPtr.h"
 
 #undef LOG
-extern PRLogModuleInfo* GetPDMLog();
+extern mozilla::LogModule* GetPDMLog();
 #define LOG(type, msg) MOZ_LOG(GetPDMLog(), type, msg)
 
 namespace mozilla {
@@ -260,7 +260,8 @@ VorbisDataDecoder::Flush()
 bool
 VorbisDataDecoder::IsVorbis(const nsACString& aMimeType)
 {
-  return aMimeType.EqualsLiteral("audio/ogg; codecs=vorbis");
+  return aMimeType.EqualsLiteral("audio/webm; codecs=vorbis") ||
+         aMimeType.EqualsLiteral("audio/ogg; codecs=vorbis");
 }
 
 

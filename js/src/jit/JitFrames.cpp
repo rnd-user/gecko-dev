@@ -827,7 +827,7 @@ HandleException(ResumeFromException* rfe)
     JitActivation* activation = cx->runtime()->activation()->asJit();
 
 #ifdef CHECK_OSIPOINT_REGISTERS
-    if (js_JitOptions.checkOsiPointRegisters)
+    if (JitOptions.checkOsiPointRegisters)
         activation->setCheckRegs(false);
 #endif
 
@@ -1055,18 +1055,20 @@ MarkThisAndArguments(JSTracer* trc, const JitFrameIterator& frame)
                              ? frame.exitFrame()->as<LazyLinkExitFrameLayout>()->jsFrame()
                              : frame.jsFrame();
 
+    if (!CalleeTokenIsFunction(layout->calleeToken()))
+        return;
+
     size_t nargs = layout->numActualArgs();
     size_t nformals = 0;
-    size_t newTargetOffset = 0;
-    if (CalleeTokenIsFunction(layout->calleeToken())) {
-        JSFunction* fun = CalleeTokenToFunction(layout->calleeToken());
-        if (!frame.isExitFrameLayout<LazyLinkExitFrameLayout>() &&
-            !fun->nonLazyScript()->argumentsHasVarBinding())
-        {
-            nformals = fun->nargs();
-        }
-        newTargetOffset = Max(nargs, fun->nargs());
+
+    JSFunction* fun = CalleeTokenToFunction(layout->calleeToken());
+    if (!frame.isExitFrameLayout<LazyLinkExitFrameLayout>() &&
+        !fun->nonLazyScript()->argumentsHasVarBinding())
+    {
+        nformals = fun->nargs();
     }
+
+    size_t newTargetOffset = Max(nargs, fun->nargs());
 
     Value* argv = layout->argv();
 
@@ -1358,14 +1360,17 @@ MarkJitExitFrame(JSTracer* trc, const JitFrameIterator& frame)
     // on them.
     MOZ_ASSERT(uintptr_t(footer->jitCode()) != uintptr_t(-1));
 
-    // This correspond to the case where we have build a fake exit frame in
-    // CodeGenerator.cpp which handle the case of a native function call. We
-    // need to mark the argument vector of the function call.
+    // This corresponds to the case where we have build a fake exit frame which
+    // handles the case of a native function call. We need to mark the argument
+    // vector of the function call, and also new.target if it was a constructing
+    // call.
     if (frame.isExitFrameLayout<NativeExitFrameLayout>()) {
         NativeExitFrameLayout* native = frame.exitFrame()->as<NativeExitFrameLayout>();
         size_t len = native->argc() + 2;
         Value* vp = native->vp();
         TraceRootRange(trc, len, vp, "ion-native-args");
+        if (frame.isExitFrameLayout<ConstructNativeExitFrameLayout>())
+            TraceRoot(trc, vp + len, "ion-native-new-target");
         return;
     }
 
@@ -1525,7 +1530,7 @@ MarkJitActivation(JSTracer* trc, const JitActivationIterator& activations)
     JitActivation* activation = activations->asJit();
 
 #ifdef CHECK_OSIPOINT_REGISTERS
-    if (js_JitOptions.checkOsiPointRegisters) {
+    if (JitOptions.checkOsiPointRegisters) {
         // GC can modify spilled registers, breaking our register checks.
         // To handle this, we disable these checks for the current VM call
         // when a GC happens.
@@ -1624,10 +1629,13 @@ GetPcScript(JSContext* cx, JSScript** scriptRes, jsbytecode** pcRes)
             MOZ_ASSERT(it.isBaselineStub() || it.isBaselineJS() || it.isIonJS());
         }
 
-        // Skip Baseline stub frames.
+        // Skip Baseline or Ion stub frames.
         if (it.isBaselineStubMaybeUnwound()) {
             ++it;
             MOZ_ASSERT(it.isBaselineJS());
+        } else if (it.isIonStubMaybeUnwound()) {
+            ++it;
+            MOZ_ASSERT(it.isIonJS());
         }
 
         MOZ_ASSERT(it.isBaselineJS() || it.isIonJS());
@@ -2596,8 +2604,7 @@ MachineState::FromBailout(RegisterDump::GPRArray& regs, RegisterDump::FPUArray& 
     for (unsigned i = 0; i < FloatRegisters::TotalPhys; i++) {
         machine.setRegisterLocation(FloatRegister(i, FloatRegisters::Single), &fpregs[i]);
         machine.setRegisterLocation(FloatRegister(i, FloatRegisters::Double), &fpregs[i]);
-        machine.setRegisterLocation(FloatRegister(i, FloatRegisters::Int32x4), &fpregs[i]);
-        machine.setRegisterLocation(FloatRegister(i, FloatRegisters::Float32x4), &fpregs[i]);
+        machine.setRegisterLocation(FloatRegister(i, FloatRegisters::Simd128), &fpregs[i]);
     }
 #elif defined(JS_CODEGEN_ARM64)
     for (unsigned i = 0; i < FloatRegisters::TotalPhys; i++) {
@@ -2697,7 +2704,7 @@ JitFrameIterator::dumpBaseline() const
     baselineScriptAndPc(script.address(), &pc);
 
     fprintf(stderr, "  script = %p, pc = %p (offset %u)\n", (void*)script, pc, uint32_t(script->pcToOffset(pc)));
-    fprintf(stderr, "  current op: %s\n", js_CodeName[*pc]);
+    fprintf(stderr, "  current op: %s\n", CodeName[*pc]);
 
     fprintf(stderr, "  actual args: %d\n", numActualArgs());
 
@@ -2741,7 +2748,7 @@ InlineFrameIterator::dump() const
             script()->filename(), script()->lineno());
 
     fprintf(stderr, "  script = %p, pc = %p\n", (void*) script(), pc());
-    fprintf(stderr, "  current op: %s\n", js_CodeName[*pc()]);
+    fprintf(stderr, "  current op: %s\n", CodeName[*pc()]);
 
     if (!more()) {
         numActualArgs();

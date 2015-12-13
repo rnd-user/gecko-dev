@@ -720,8 +720,12 @@ FormatFrame(JSContext* cx, const ScriptFrameIter& iter, char* buf, int num,
         funname = fun->displayAtom();
 
     RootedValue thisVal(cx);
-    if (iter.hasUsableAbstractFramePtr() && iter.computeThis(cx)) {
-        thisVal = iter.computedThisValue();
+    if (iter.hasUsableAbstractFramePtr() &&
+        iter.isNonEvalFunctionFrame() &&
+        fun && !fun->isArrow() && !fun->isDerivedClassConstructor())
+    {
+        if (!GetFunctionThis(cx, iter.abstractFramePtr(), &thisVal))
+            return nullptr;
     }
 
     // print the frame number and function name
@@ -1141,24 +1145,28 @@ js::detail::IdMatchesAtom(jsid id, JSAtom* atom)
     return id == INTERNED_STRING_TO_JSID(nullptr, atom);
 }
 
-JS_FRIEND_API(bool)
-js::PrepareScriptEnvironmentAndInvoke(JSRuntime* rt, HandleObject scope, ScriptEnvironmentPreparer::Closure& closure)
+JS_FRIEND_API(void)
+js::PrepareScriptEnvironmentAndInvoke(JSContext* cx, HandleObject scope, ScriptEnvironmentPreparer::Closure& closure)
 {
-    if (rt->scriptEnvironmentPreparer)
-        return rt->scriptEnvironmentPreparer->invoke(scope, closure);
+    MOZ_ASSERT(!cx->isExceptionPending());
 
-    MOZ_ASSERT(rt->contextList.getFirst() == rt->contextList.getLast());
-    JSContext* cx = rt->contextList.getFirst();
+    if (cx->runtime()->scriptEnvironmentPreparer) {
+        cx->runtime()->scriptEnvironmentPreparer->invoke(scope, closure);
+        return;
+    }
+
     JSAutoCompartment ac(cx, scope);
     bool ok = closure(cx);
 
+    MOZ_ASSERT_IF(ok, !cx->isExceptionPending());
+
     // NB: This does not affect Gecko, which has a prepareScriptEnvironment
     // callback.
-    if (JS_IsExceptionPending(cx)) {
+    if (!ok) {
         JS_ReportPendingException(cx);
     }
 
-    return ok;
+    MOZ_ASSERT(!cx->isExceptionPending());
 }
 
 JS_FRIEND_API(void)

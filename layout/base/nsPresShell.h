@@ -161,11 +161,13 @@ public:
 
   virtual void UnsuppressPainting() override;
 
-  virtual nsresult GetAgentStyleSheets(nsCOMArray<nsIStyleSheet>& aSheets) override;
-  virtual nsresult SetAgentStyleSheets(const nsCOMArray<nsIStyleSheet>& aSheets) override;
+  virtual nsresult GetAgentStyleSheets(
+      nsTArray<RefPtr<mozilla::CSSStyleSheet>>& aSheets) override;
+  virtual nsresult SetAgentStyleSheets(
+      const nsTArray<RefPtr<mozilla::CSSStyleSheet>>& aSheets) override;
 
-  virtual nsresult AddOverrideStyleSheet(nsIStyleSheet *aSheet) override;
-  virtual nsresult RemoveOverrideStyleSheet(nsIStyleSheet *aSheet) override;
+  virtual nsresult AddOverrideStyleSheet(mozilla::CSSStyleSheet* aSheet) override;
+  virtual nsresult RemoveOverrideStyleSheet(mozilla::CSSStyleSheet* aSheet) override;
 
   virtual nsresult HandleEventWithTarget(
                                  mozilla::WidgetEvent* aEvent,
@@ -216,6 +218,7 @@ public:
   }
   virtual bool ScaleToResolution() const override;
   virtual float GetCumulativeResolution() override;
+  virtual float GetCumulativeNonRootScaleResolution() override;
 
   //nsIViewObserver interface
 
@@ -286,9 +289,6 @@ public:
   NS_IMETHOD CheckVisibility(nsIDOMNode *node, int16_t startOffset, int16_t EndOffset, bool *_retval) override;
   virtual nsresult CheckVisibilityContent(nsIContent* aNode, int16_t aStartOffset,
                                           int16_t aEndOffset, bool* aRetval) override;
-
-  NS_IMETHOD GetSelectionCaretsVisibility(bool* aOutVisibility) override;
-  NS_IMETHOD SetSelectionCaretsVisibility(bool aVisibility) override;
 
   // nsIDocumentObserver
   NS_DECL_NSIDOCUMENTOBSERVER_BEGINUPDATE
@@ -478,7 +478,7 @@ protected:
       : mResolution(aPresShell->mResolution)
       , mRenderFlags(aPresShell->mRenderFlags)
     { }
-    float mResolution;
+    mozilla::Maybe<float> mResolution;
     RenderFlags mRenderFlags;
   };
 
@@ -516,7 +516,7 @@ protected:
   void ShowEventTargetDebug();
 #endif
 
-  void RecordStyleSheetChange(nsIStyleSheet* aStyleSheet);
+  void RecordStyleSheetChange(mozilla::CSSStyleSheet* aStyleSheet);
 
   void RemovePreferenceStyles();
 

@@ -1221,6 +1221,14 @@ JS_GetErrorPrototype(JSContext* cx)
 }
 
 JS_PUBLIC_API(JSObject*)
+JS_GetIteratorPrototype(JSContext* cx)
+{
+    CHECK_REQUEST(cx);
+    Rooted<GlobalObject*> global(cx, cx->global());
+    return GlobalObject::getOrCreateIteratorPrototype(cx, global);
+}
+
+JS_PUBLIC_API(JSObject*)
 JS_GetGlobalForObject(JSContext* cx, JSObject* obj)
 {
     AssertHeapIsIdle(cx);
@@ -2082,7 +2090,6 @@ DefinePropertyById(JSContext* cx, HandleObject obj, HandleId id, HandleValue val
     {
         RootedAtom atom(cx, JSID_IS_ATOM(id) ? JSID_TO_ATOM(id) : nullptr);
         if (getter && !(attrs & JSPROP_GETTER)) {
-            RootedObject global(cx, (JSObject*) &obj->global());
             JSFunction* getobj = NewNativeFunction(cx, (Native) getter, 0, atom);
             if (!getobj)
                 return false;
@@ -2096,7 +2103,6 @@ DefinePropertyById(JSContext* cx, HandleObject obj, HandleId id, HandleValue val
         if (setter && !(attrs & JSPROP_SETTER)) {
             // Root just the getter, since the setter is not yet a JSObject.
             AutoRooterGetterSetter getRoot(cx, JSPROP_GETTER, &getter, nullptr);
-            RootedObject global(cx, (JSObject*) &obj->global());
             JSFunction* setobj = NewNativeFunction(cx, (Native) setter, 1, atom);
             if (!setobj)
                 return false;
@@ -3445,8 +3451,13 @@ IsFunctionCloneable(HandleFunction fun)
         if (IsStaticGlobalLexicalScope(scope))
             return true;
 
-        // 'eval' and non-syntactic scopes are always scoped immediately under
-        // a non-extensible lexical scope.
+        // If the script already deals with non-syntactic scopes, we can clone
+        // it.
+        if (scope->is<StaticNonSyntacticScopeObjects>())
+            return true;
+
+        // 'eval' scopes are always scoped immediately under a non-extensible
+        // lexical scope.
         if (scope->is<StaticBlockObject>()) {
             StaticBlockObject& block = scope->as<StaticBlockObject>();
             if (block.needsClone())
@@ -3458,11 +3469,6 @@ IsFunctionCloneable(HandleFunction fun)
             // under the global, we can clone it.
             if (enclosing->is<StaticEvalObject>())
                 return !enclosing->as<StaticEvalObject>().isNonGlobal();
-
-            // If the script already deals with a non-syntactic scope, we can
-            // clone it.
-            if (enclosing->is<StaticNonSyntacticScopeObjects>())
-                return true;
         }
 
         // Any other enclosing static scope (e.g., function, block) cannot be
@@ -3528,7 +3534,16 @@ CloneFunctionObject(JSContext* cx, HandleObject funobj, HandleObject dynamicScop
         return CloneFunctionReuseScript(cx, fun, dynamicScope, fun->getAllocKind());
     }
 
-    return CloneFunctionAndScript(cx, fun, dynamicScope, staticScope, fun->getAllocKind());
+    JSFunction* clone = CloneFunctionAndScript(cx, fun, dynamicScope, staticScope,
+                                               fun->getAllocKind());
+
+#ifdef DEBUG
+    // The cloned function should itself be cloneable.
+    RootedFunction cloneRoot(cx, clone);
+    MOZ_ASSERT_IF(cloneRoot, IsFunctionCloneable(cloneRoot));
+#endif
+
+    return clone;
 }
 
 namespace JS {
@@ -3971,7 +3986,12 @@ JS::CompileOptions::CompileOptions(JSContext* cx, JSVersion version)
     strictOption = cx->runtime()->options().strictMode();
     extraWarningsOption = cx->compartment()->options().extraWarnings(cx);
     werrorOption = cx->runtime()->options().werror();
-    asmJSOption = cx->runtime()->options().asmJS();
+    if (!cx->runtime()->options().asmJS())
+        asmJSOption = AsmJSOption::Disabled;
+    else if (cx->compartment()->debuggerObservesAsmJS())
+        asmJSOption = AsmJSOption::DisabledByDebugger;
+    else
+        asmJSOption = AsmJSOption::Enabled;
     throwOnAsmJSValidationFailureOption = cx->runtime()->options().throwOnAsmJSValidationFailure();
 }
 
@@ -5827,35 +5847,35 @@ JS_SetGlobalJitCompilerOption(JSRuntime* rt, JSJitCompilerOption opt, uint32_t v
     switch (opt) {
       case JSJITCOMPILER_BASELINE_WARMUP_TRIGGER:
         if (value == uint32_t(-1)) {
-            jit::JitOptions defaultValues;
+            jit::DefaultJitOptions defaultValues;
             value = defaultValues.baselineWarmUpThreshold;
         }
-        jit::js_JitOptions.baselineWarmUpThreshold = value;
+        jit::JitOptions.baselineWarmUpThreshold = value;
         break;
       case JSJITCOMPILER_ION_WARMUP_TRIGGER:
         if (value == uint32_t(-1)) {
-            jit::js_JitOptions.resetCompilerWarmUpThreshold();
+            jit::JitOptions.resetCompilerWarmUpThreshold();
             break;
         }
-        jit::js_JitOptions.setCompilerWarmUpThreshold(value);
+        jit::JitOptions.setCompilerWarmUpThreshold(value);
         if (value == 0)
-            jit::js_JitOptions.setEagerCompilation();
+            jit::JitOptions.setEagerCompilation();
         break;
       case JSJITCOMPILER_ION_GVN_ENABLE:
         if (value == 0) {
-            jit::js_JitOptions.enableGvn(false);
+            jit::JitOptions.enableGvn(false);
             JitSpew(js::jit::JitSpew_IonScripts, "Disable ion's GVN");
         } else {
-            jit::js_JitOptions.enableGvn(true);
+            jit::JitOptions.enableGvn(true);
             JitSpew(js::jit::JitSpew_IonScripts, "Enable ion's GVN");
         }
         break;
       case JSJITCOMPILER_ION_FORCE_IC:
         if (value == 0) {
-            jit::js_JitOptions.forceInlineCaches = false;
+            jit::JitOptions.forceInlineCaches = false;
             JitSpew(js::jit::JitSpew_IonScripts, "IonBuilder: Enable non-IC optimizations.");
         } else {
-            jit::js_JitOptions.forceInlineCaches = true;
+            jit::JitOptions.forceInlineCaches = true;
             JitSpew(js::jit::JitSpew_IonScripts, "IonBuilder: Disable non-IC optimizations.");
         }
         break;
@@ -5908,13 +5928,13 @@ JS_GetGlobalJitCompilerOption(JSRuntime* rt, JSJitCompilerOption opt)
 #ifndef JS_CODEGEN_NONE
     switch (opt) {
       case JSJITCOMPILER_BASELINE_WARMUP_TRIGGER:
-        return jit::js_JitOptions.baselineWarmUpThreshold;
+        return jit::JitOptions.baselineWarmUpThreshold;
       case JSJITCOMPILER_ION_WARMUP_TRIGGER:
-        return jit::js_JitOptions.forcedDefaultIonWarmUpThreshold.isSome()
-             ? jit::js_JitOptions.forcedDefaultIonWarmUpThreshold.ref()
+        return jit::JitOptions.forcedDefaultIonWarmUpThreshold.isSome()
+             ? jit::JitOptions.forcedDefaultIonWarmUpThreshold.ref()
              : jit::OptimizationInfo::CompilerWarmupThreshold;
       case JSJITCOMPILER_ION_FORCE_IC:
-        return jit::js_JitOptions.forceInlineCaches;
+        return jit::JitOptions.forceInlineCaches;
       case JSJITCOMPILER_ION_ENABLE:
         return JS::RuntimeOptionsRef(rt).ion();
       case JSJITCOMPILER_BASELINE_ENABLE:

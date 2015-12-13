@@ -245,7 +245,7 @@ nvFIFO::VariableLength() const
   return mTable.GetSize();
 }
 
-uint32_t
+size_t
 nvFIFO::StaticLength() const
 {
   return gStaticHeaders->GetSize();
@@ -260,7 +260,7 @@ nvFIFO::Clear()
 }
 
 const nvPair *
-nvFIFO::operator[] (int32_t index) const
+nvFIFO::operator[] (size_t index) const
 {
   // NWGH - ensure index > 0
   // NWGH - subtract 1 from index here
@@ -860,6 +860,9 @@ Http2Decompressor::DoLiteralInternal(nsACString &name, nsACString &value,
            value.BeginReading()));
       return NS_ERROR_ILLEGAL_VALUE;
     }
+    // Increment this to avoid always finding the same newline and looping
+    // forever
+    ++newline;
   }
 
   LOG(("Http2Decompressor::DoLiteralInternal value %s", value.BeginReading()));

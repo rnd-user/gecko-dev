@@ -24,7 +24,6 @@ XPCOMUtils.defineLazyServiceGetter(
 
 Cu.import("chrome://marionette/content/actions.js");
 Cu.import("chrome://marionette/content/elements.js");
-Cu.import("chrome://marionette/content/emulator.js");
 Cu.import("chrome://marionette/content/error.js");
 Cu.import("chrome://marionette/content/modal.js");
 Cu.import("chrome://marionette/content/proxy.js");
@@ -95,12 +94,17 @@ this.Context.fromString = function(s) {
  *     Description of the product, for example "B2G" or "Firefox".
  * @param {string} device
  *     Device this driver should assume.
+ * @param {function()} stopSignal
+ *     Signal to stop the Marionette server.
  * @param {Emulator=} emulator
  *     Reference to the emulator connection, if running on an emulator.
  */
-this.GeckoDriver = function(appName, device, emulator) {
+this.GeckoDriver = function(appName, device, stopSignal, emulator) {
   this.appName = appName;
+  this.stopSignal_ = stopSignal;
   this.emulator = emulator;
+  // TODO(ato): hack
+  this.emulator.sendToListener = this.sendAsync.bind(this);
 
   this.sessionId = null;
   // holds list of BrowserObjs
@@ -136,14 +140,14 @@ this.GeckoDriver = function(appName, device, emulator) {
   this.actions = new ActionChain(utils);
 
   this.sessionCapabilities = {
-    // Mandated capabilities
-    "browserName": this.appName,
+    // mandated capabilities
+    "browserName": Services.appinfo.name,
     "browserVersion": Services.appinfo.version,
-    "platformName": Services.appinfo.OS.toUpperCase(),
-    "platformVersion": Services.appinfo.platformVersion,
+    "platformName": Services.sysinfo.getProperty("name"),
+    "platformVersion": Services.sysinfo.getProperty("version"),
     "specificationLevel": "1",
 
-    // Supported features
+    // supported features
     "raisesAccessibilityExceptions": false,
     "rotatable": this.appName == "B2G",
     "acceptSslCerts": false,
@@ -152,18 +156,19 @@ this.GeckoDriver = function(appName, device, emulator) {
     "proxy": {},
 
     // Selenium 2 compat
-    "platform": Services.appinfo.OS.toUpperCase(),
+    "platform": Services.sysinfo.getProperty("name").toUpperCase(),
 
-    // Proprietary extensions
+    // proprietary extensions
     "XULappId" : Services.appinfo.ID,
     "appBuildId" : Services.appinfo.appBuildID,
     "device": device,
-    "version": Services.appinfo.version
+    "version": Services.appinfo.version,
   };
 
   this.mm = globalMessageManager;
   this.listener = proxy.toListener(() => this.mm, this.sendAsync.bind(this));
 
+  // always keep weak reference to current dialogue
   this.dialog = null;
   let handleDialog = (subject, topic) => {
     let winr;
@@ -1083,11 +1088,6 @@ GeckoDriver.prototype.executeWithCallback = function(cmd, resp, directInject) {
 
   let res = yield new Promise(function(resolve, reject) {
     let chromeAsyncReturnFunc = function(val) {
-      if (that.emulator.cbs.length > 0) {
-        that.emulator.cbs = [];
-        throw new WebDriverError("Emulator callback still pending when finish() called");
-      }
-
       if (cmd.id == that.sandboxes[sandboxName].command_id) {
         if (that.timer !== null) {
           that.timer.cancel();
@@ -1133,20 +1133,11 @@ GeckoDriver.prototype.executeWithCallback = function(cmd, resp, directInject) {
     }
 
     this.sandboxes[sandboxName].command_id = cmd.id;
-    this.sandboxes[sandboxName].runEmulatorCmd = (cmd, cb) => {
-      let ecb = new EmulatorCallback();
-      ecb.onresult = cb;
-      ecb.onerror = chromeAsyncError;
-      this.emulator.pushCallback(ecb);
-      this.emulator.send({emulator_cmd: cmd, id: ecb.id});
-    };
-    this.sandboxes[sandboxName].runEmulatorShell = (args, cb) => {
-      let ecb = new EmulatorCallback();
-      ecb.onresult = cb;
-      ecb.onerror = chromeAsyncError;
-      this.emulator.pushCallback(ecb);
-      this.emulator.send({emulator_shell: args, id: ecb.id});
-    };
+    this.sandboxes[sandboxName].runEmulatorCmd =
+        (cmd, cb) => this.emulator.command(cmd, cb, chromeAsyncError);
+    this.sandboxes[sandboxName].runEmulatorShell =
+        (args, cb) => this.emulator.shell(args, cb, chromeAsyncError);
+
     this.applyArgumentsToSandbox(win, this.sandboxes[sandboxName], args);
 
     // NB: win.onerror is not hooked by default due to the inability to
@@ -1857,12 +1848,12 @@ GeckoDriver.prototype.actionChain = function(cmd, resp) {
 
       let win = this.getCurrentWindow();
       let elm = this.curBrowser.elementManager;
-      this.actions.dispatchActions(chain, nextId, { frame: win }, elm, cbs);
+      this.actions.dispatchActions(chain, nextId, {frame: win}, elm, cbs);
       break;
 
     case Context.CONTENT:
       this.addFrameCloseListener("action chain");
-      resp.body.value = yield this.listener.actionChain({chain: chain, nextId: nextId});
+      resp.body.value = yield this.listener.actionChain(chain, nextId);
       break;
   }
 };
@@ -1882,8 +1873,7 @@ GeckoDriver.prototype.multiAction = function(cmd, resp) {
 
     case Context.CONTENT:
       this.addFrameCloseListener("multi action chain");
-      yield this.listener.multiAction(
-          {value: cmd.parameters.value, maxlen: cmd.parameters.max_len});
+      yield this.listener.multiAction(cmd.parameters.value, cmd.parameters.max_length);
       break;
   }
 };
@@ -2291,7 +2281,22 @@ GeckoDriver.prototype.switchToShadowRoot = function(cmd, resp) {
 
 /** Add a cookie to the document. */
 GeckoDriver.prototype.addCookie = function(cmd, resp) {
-  yield this.listener.addCookie({cookie: cmd.parameters.cookie});
+  let cb = msg => {
+    this.mm.removeMessageListener("Marionette:addCookie", cb);
+    let cookie = msg.json;
+    Services.cookies.add(
+        cookie.domain,
+        cookie.path,
+        cookie.name,
+        cookie.value,
+        cookie.secure,
+        cookie.httpOnly,
+        cookie.session,
+        cookie.expiry);
+    return true;
+  };
+  this.mm.addMessageListener("Marionette:addCookie", cb);
+  yield this.listener.addCookie(cmd.parameters.cookie);
 };
 
 /**
@@ -2306,12 +2311,34 @@ GeckoDriver.prototype.getCookies = function(cmd, resp) {
 
 /** Delete all cookies that are visible to a document. */
 GeckoDriver.prototype.deleteAllCookies = function(cmd, resp) {
+  let cb = msg => {
+    let cookie = msg.json;
+    cookieManager.remove(
+        cookie.host,
+        cookie.name,
+        cookie.path,
+        false);
+    return true;
+  };
+  this.mm.addMessageListener("Marionette:deleteCookie", cb);
   yield this.listener.deleteAllCookies();
+  this.mm.removeMessageListener("Marionette:deleteCookie", cb);
 };
 
 /** Delete a cookie by name. */
 GeckoDriver.prototype.deleteCookie = function(cmd, resp) {
-  yield this.listener.deleteCookie({name: cmd.parameters.name});
+  let cb = msg => {
+    this.mm.removeMessageListener("Marionette:deleteCookie", cb);
+    let cookie = msg.json;
+    cookieManager.remove(
+        cookie.host,
+        cookie.name,
+        cookie.path,
+        false);
+    return true;
+  };
+  this.mm.addMessageListener("Marionette:deleteCookie", cb);
+  yield this.listener.deleteCookie(cmd.parameters.name);
 };
 
 /**
@@ -2765,6 +2792,27 @@ GeckoDriver.prototype.sendKeysToDialog = function(cmd, resp) {
 };
 
 /**
+ * Quits Firefox with the provided flags and tears down the current
+ * session.
+ */
+GeckoDriver.prototype.quitApplication = function(cmd, resp) {
+  if (this.appName != "Firefox") {
+    throw new WebDriverError("In app initiated quit only supported in Firefox");
+  }
+
+  let flags = Ci.nsIAppStartup.eAttemptQuit;
+  for (let k of cmd.parameters.flags) {
+    flags |= Ci.nsIAppStartup[k];
+  }
+
+  this.stopSignal_();
+  resp.send();
+
+  this.sessionTearDown();
+  Services.startup.quit(flags);
+};
+
+/**
  * Helper function to convert an outerWindowID into a UID that Marionette
  * tracks.
  */
@@ -2775,14 +2823,18 @@ GeckoDriver.prototype.generateFrameId = function(id) {
 
 /** Receives all messages from content messageManager. */
 GeckoDriver.prototype.receiveMessage = function(message) {
-  // we need to just check if we need to remove the mozbrowserclose listener
-  if (this.mozBrowserClose !== null) {
-    let win = this.getCurrentWindow();
-    win.removeEventListener("mozbrowserclose", this.mozBrowserClose, true);
-    this.mozBrowserClose = null;
-  }
-
   switch (message.name) {
+    case "Marionette:ok":
+    case "Marionette:done":
+    case "Marionette:error":
+      // check if we need to remove the mozbrowserclose listener
+      if (this.mozBrowserClose !== null) {
+        let win = this.getCurrentWindow();
+        win.removeEventListener("mozbrowserclose", this.mozBrowserClose, true);
+        this.mozBrowserClose = null;
+      }
+      break;
+
     case "Marionette:log":
       // log server-side messages
       logger.info(message.json.message);
@@ -2793,11 +2845,6 @@ GeckoDriver.prototype.receiveMessage = function(message) {
       if (message.json.log) {
         this.marionetteLog.addLogs(message.json.log);
       }
-      break;
-
-    case "Marionette:runEmulatorCmd":
-    case "Marionette:runEmulatorShell":
-      this.emulator.send(message.json);
       break;
 
     case "Marionette:switchToModalOrigin":
@@ -2821,7 +2868,7 @@ GeckoDriver.prototype.receiveMessage = function(message) {
       break;
 
     case "Marionette:getVisibleCookies":
-      let [currentPath, host] = message.json.value;
+      let [currentPath, host] = message.json;
       let isForCurrentPath = path => currentPath.indexOf(path) != -1;
       let results = [];
 
@@ -2848,28 +2895,6 @@ GeckoDriver.prototype.receiveMessage = function(message) {
         } while (hostname.indexOf(".") != -1);
       }
       return results;
-
-    case "Marionette:addCookie":
-      let cookieToAdd = message.json.value;
-      Services.cookies.add(
-          cookieToAdd.domain,
-          cookieToAdd.path,
-          cookieToAdd.name,
-          cookieToAdd.value,
-          cookieToAdd.secure,
-          cookieToAdd.httpOnly,
-          false,
-          cookieToAdd.expiry);
-      return true;
-
-    case "Marionette:deleteCookie":
-      let cookieToDelete = message.json.value;
-      cookieManager.remove(
-          cookieToDelete.host,
-          cookieToDelete.name,
-          cookieToDelete.path,
-          false);
-      return true;
 
     case "Marionette:getFiles":
       // Generates file objects to send back to the content script
@@ -3004,7 +3029,8 @@ GeckoDriver.prototype.commands = {
   "dismissDialog": GeckoDriver.prototype.dismissDialog,
   "acceptDialog": GeckoDriver.prototype.acceptDialog,
   "getTextFromDialog": GeckoDriver.prototype.getTextFromDialog,
-  "sendKeysToDialog": GeckoDriver.prototype.sendKeysToDialog
+  "sendKeysToDialog": GeckoDriver.prototype.sendKeysToDialog,
+  "quitApplication": GeckoDriver.prototype.quitApplication,
 };
 
 /**
@@ -3208,7 +3234,9 @@ BrowserObj.prototype.hasRemotenessChange = function() {
     return true;
   }
 
-  let currentIsRemote = this.browserForTab.isRemoteBrowser;
+  // this.tab can potentially get stale and cause problems, see bug 1227252
+  let currentTab = this.browser.selectedTab;
+  let currentIsRemote = this.browser.getBrowserForTab(currentTab).isRemoteBrowser;
   this._hasRemotenessChange = this._browserWasRemote !== currentIsRemote;
   this._browserWasRemote = currentIsRemote;
   return this._hasRemotenessChange;

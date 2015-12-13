@@ -121,7 +121,12 @@ enum VarEmitOption {
     // Emit code to evaluate initializer expressions and leave those values on
     // the stack. This is used to implement `for (let/const ...;;)` and
     // deprecated `let` blocks.
-    PushInitialValues
+    PushInitialValues,
+
+    // Like InitializeVars, but bind using BINDVAR instead of
+    // BINDNAME/BINDGNAME. Only used for emitting declarations synthesized for
+    // Annex B block-scoped function semantics.
+    AnnexB,
 };
 
 struct BytecodeEmitter
@@ -249,7 +254,10 @@ struct BytecodeEmitter
         return parser->blockScopes[dn->pn_blockid];
     }
 
-    bool atBodyLevel() const;
+    bool atBodyLevel(StmtInfoBCE* stmt) const;
+    bool atBodyLevel() const {
+        return atBodyLevel(innermostStmt());
+    }
     uint32_t computeHops(ParseNode* pn, BytecodeEmitter** bceOfDefOut);
     bool isAliasedName(BytecodeEmitter* bceOfDef, ParseNode* pn);
     bool computeDefinitionIsAliased(BytecodeEmitter* bceOfDef, Definition* dn, JSOp* op);
@@ -351,9 +359,6 @@ struct BytecodeEmitter
     // Emit module code for the tree rooted at body.
     bool emitModuleScript(ParseNode* body);
 
-    // Report an error if we are not processing a module.
-    bool checkIsModule();
-
     // If op is JOF_TYPESET (see the type barriers comment in TypeInference.h),
     // reserve a type set to store its result.
     void checkTypeSet(JSOp op);
@@ -423,6 +428,18 @@ struct BytecodeEmitter
 
     bool emitNumberOp(double dval);
 
+    bool emitThisLiteral(ParseNode* pn);
+    bool emitCreateFunctionThis();
+    bool emitGetFunctionThis(ParseNode* pn);
+    bool emitGetThisForSuperBase(ParseNode* pn);
+    bool emitSetThis(ParseNode* pn);
+
+    // These functions are used to emit GETLOCAL/GETALIASEDVAR or
+    // SETLOCAL/SETALIASEDVAR for a particular binding. The CallObject must be
+    // on top of the scope chain.
+    bool emitLoadFromTopScope(BindingIter& bi);
+    bool emitStoreToTopScope(BindingIter& bi);
+
     bool emitJump(JSOp op, ptrdiff_t off, ptrdiff_t* jumpOffset = nullptr);
     bool emitCall(JSOp op, uint16_t argc, ParseNode* pn = nullptr);
 
@@ -443,6 +460,7 @@ struct BytecodeEmitter
     bool emitAtomOp(JSAtom* atom, JSOp op);
     bool emitAtomOp(ParseNode* pn, JSOp op);
 
+    bool emitArrayLiteral(ParseNode* pn);
     bool emitArray(ParseNode* pn, uint32_t count, JSOp op);
     bool emitArrayComp(ParseNode* pn);
 
@@ -453,6 +471,8 @@ struct BytecodeEmitter
 
     MOZ_NEVER_INLINE bool emitFunction(ParseNode* pn, bool needsProto = false);
     MOZ_NEVER_INLINE bool emitObject(ParseNode* pn);
+
+    bool emitHoistedFunctionsInList(ParseNode* pn);
 
     bool emitPropertyList(ParseNode* pn, MutableHandlePlainObject objp, PropListType type);
 
@@ -499,7 +519,8 @@ struct BytecodeEmitter
     // Emit bytecode to put operands for a JSOP_GETELEM/CALLELEM/SETELEM/DELELEM
     // opcode onto the stack in the right order. In the case of SETELEM, the
     // value to be assigned must already be pushed.
-    bool emitElemOperands(ParseNode* pn, JSOp op);
+    enum class EmitElemOption { Get, Set, Call, IncDec };
+    bool emitElemOperands(ParseNode* pn, EmitElemOption opts);
 
     bool emitElemOpBase(JSOp op);
     bool emitElemOp(ParseNode* pn, JSOp op);
@@ -566,7 +587,7 @@ struct BytecodeEmitter
 
     bool emitReturn(ParseNode* pn);
     bool emitStatement(ParseNode* pn);
-    bool emitStatementList(ParseNode* pn, ptrdiff_t top);
+    bool emitStatementList(ParseNode* pn);
 
     bool emitDeleteName(ParseNode* pn);
     bool emitDeleteProperty(ParseNode* pn);
@@ -576,8 +597,11 @@ struct BytecodeEmitter
     // |op| must be JSOP_TYPEOF or JSOP_TYPEOFEXPR.
     bool emitTypeof(ParseNode* node, JSOp op);
 
-    bool emitLogical(ParseNode* pn);
     bool emitUnary(ParseNode* pn);
+    bool emitRightAssociative(ParseNode* pn);
+    bool emitLeftAssociative(ParseNode* pn);
+    bool emitLogical(ParseNode* pn);
+    bool emitSequenceExpr(ParseNode* pn);
 
     MOZ_NEVER_INLINE bool emitIncOrDec(ParseNode* pn);
 
@@ -588,16 +612,22 @@ struct BytecodeEmitter
     bool emitSelfHostedResumeGenerator(ParseNode* pn);
     bool emitSelfHostedForceInterpreter(ParseNode* pn);
 
+    bool emitComprehensionFor(ParseNode* compFor);
+    bool emitComprehensionForIn(ParseNode* pn);
+    bool emitComprehensionForInOrOfVariables(ParseNode* pn, bool* letBlockScope);
+    bool emitComprehensionForOf(ParseNode* pn);
+
     bool emitDo(ParseNode* pn);
-    bool emitFor(ParseNode* pn, ptrdiff_t top);
-    bool emitForIn(ParseNode* pn, ptrdiff_t top);
-    bool emitForInOrOfVariables(ParseNode* pn, bool* letDecl);
-    bool emitCStyleFor(ParseNode* pn, ptrdiff_t top);
-    bool emitWhile(ParseNode* pn, ptrdiff_t top);
+    bool emitFor(ParseNode* pn);
+    bool emitForIn(ParseNode* pn);
+    bool emitForInOrOfVariables(ParseNode* pn);
+    bool emitCStyleFor(ParseNode* pn);
+    bool emitWhile(ParseNode* pn);
 
     bool emitBreak(PropertyName* label);
     bool emitContinue(PropertyName* label);
 
+    bool emitArgsBody(ParseNode* pn);
     bool emitDefaultsAndDestructuring(ParseNode* pn);
     bool emitLexicalInitialization(ParseNode* pn, JSOp globalDefOp);
 
@@ -620,13 +650,12 @@ struct BytecodeEmitter
     //
     // Please refer the comment above emitSpread for additional information about
     // stack convention.
-    bool emitForOf(StmtType type, ParseNode* pn, ptrdiff_t top);
+    bool emitForOf(StmtType type, ParseNode* pn);
 
     bool emitClass(ParseNode* pn);
-    bool emitSuperPropLHS(bool isCall = false);
+    bool emitSuperPropLHS(ParseNode* superBase, bool isCall = false);
     bool emitSuperPropOp(ParseNode* pn, JSOp op, bool isCall = false);
-    enum SuperElemOptions { SuperElem_Get, SuperElem_Set, SuperElem_Call, SuperElem_IncDec };
-    bool emitSuperElemOperands(ParseNode* pn, SuperElemOptions opts = SuperElem_Get);
+    bool emitSuperElemOperands(ParseNode* pn, EmitElemOption opts = EmitElemOption::Get);
     bool emitSuperElemOp(ParseNode* pn, JSOp op, bool isCall = false);
 };
 

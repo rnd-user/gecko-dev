@@ -104,7 +104,14 @@ typedef void* nsNativeWidget;
 #define NS_NATIVE_SHAREABLE_WINDOW 11
 #define NS_NATIVE_OPENGL_CONTEXT   12
 // See RegisterPluginWindowForRemoteUpdates
-#define NS_NATIVE_PLUGIN_ID            13
+#define NS_NATIVE_PLUGIN_ID        13
+// This is available only with GetNativeData() in parent process.  Anybody
+// shouldn't access this pointer as a valid pointer since the result may be
+// special value like NS_ONLY_ONE_NATIVE_IME_CONTEXT.  So, the result is just
+// an identifier of distinguishing a text composition is caused by which native
+// IME context.  Note that the result is only valid in the process.  So,
+// XP code should use nsIWidget::GetNativeIMEContext() instead of using this.
+#define NS_RAW_NATIVE_IME_CONTEXT  14
 #ifdef XP_MACOSX
 #define NS_NATIVE_PLUGIN_PORT_QD    100
 #define NS_NATIVE_PLUGIN_PORT_CG    101
@@ -123,8 +130,8 @@ typedef void* nsNativeWidget;
 #endif
 
 #define NS_IWIDGET_IID \
-{ 0x7b736a0c, 0x2262, 0x4f37, \
-  { 0xbd, 0xed, 0xe5, 0x60, 0x88, 0x1c, 0x36, 0xdd } }
+{ 0xaaa79c8d, 0xc99d, 0x4fe1, \
+  { 0xa5, 0x11, 0xd3, 0xeb, 0xb1, 0x61, 0x9e, 0x26 } }
 
 /*
  * Window shadow styles
@@ -329,9 +336,16 @@ class nsIWidget : public nsISupports {
     typedef mozilla::widget::IMEState IMEState;
     typedef mozilla::widget::InputContext InputContext;
     typedef mozilla::widget::InputContextAction InputContextAction;
+    typedef mozilla::widget::NativeIMEContext NativeIMEContext;
     typedef mozilla::widget::SizeConstraints SizeConstraints;
     typedef mozilla::widget::TextEventDispatcher TextEventDispatcher;
     typedef mozilla::CompositorVsyncDispatcher CompositorVsyncDispatcher;
+    typedef mozilla::LayoutDeviceIntMargin LayoutDeviceIntMargin;
+    typedef mozilla::LayoutDeviceIntPoint LayoutDeviceIntPoint;
+    typedef mozilla::LayoutDeviceIntRect LayoutDeviceIntRect;
+    typedef mozilla::LayoutDeviceIntRegion LayoutDeviceIntRegion;
+    typedef mozilla::LayoutDeviceIntSize LayoutDeviceIntSize;
+    typedef mozilla::ScreenIntPoint ScreenIntPoint;
 
     // Used in UpdateThemeGeometries.
     struct ThemeGeometry {
@@ -339,9 +353,10 @@ class nsIWidget : public nsISupports {
       // nsITheme::ThemeGeometryTypeForWidget.
       nsITheme::ThemeGeometryType mType;
       // The device-pixel rect within the window for the themed widget
-      nsIntRect mRect;
+      LayoutDeviceIntRect mRect;
 
-      ThemeGeometry(nsITheme::ThemeGeometryType aType, const nsIntRect& aRect)
+      ThemeGeometry(nsITheme::ThemeGeometryType aType,
+                    const LayoutDeviceIntRect& aRect)
         : mType(aType)
         , mRect(aRect)
       { }
@@ -390,10 +405,10 @@ class nsIWidget : public nsISupports {
      * @param     aInitData     data that is used for widget initialization
      *
      */
-    NS_IMETHOD Create(nsIWidget        *aParent,
-                      nsNativeWidget   aNativeParent,
-                      const nsIntRect  &aRect,
-                      nsWidgetInitData *aInitData = nullptr) = 0;
+    NS_IMETHOD Create(nsIWidget* aParent,
+                      nsNativeWidget aNativeParent,
+                      const LayoutDeviceIntRect& aRect,
+                      nsWidgetInitData* aInitData = nullptr) = 0;
 
     /**
      * Allocate, initialize, and return a widget that is a child of
@@ -412,9 +427,9 @@ class nsIWidget : public nsISupports {
      * understood code, and shouldn't be used in new code.
      */
     virtual already_AddRefed<nsIWidget>
-    CreateChild(const nsIntRect  &aRect,
-                nsWidgetInitData *aInitData = nullptr,
-                bool             aForceUseIWidgetParent = false) = 0;
+    CreateChild(const LayoutDeviceIntRect& aRect,
+                nsWidgetInitData* aInitData = nullptr,
+                bool aForceUseIWidgetParent = false) = 0;
 
     /**
      * Attach to a top level widget. 
@@ -589,6 +604,15 @@ class nsIWidget : public nsISupports {
      *
      */
     NS_IMETHOD SetModal(bool aModal) = 0;
+
+    /**
+     * Make the non-modal window opened by modal window fake-modal, that will
+     * call SetFakeModal(false) on destroy on Cocoa.
+     */
+    NS_IMETHOD SetFakeModal(bool aModal)
+    {
+        return SetModal(aModal);
+    }
 
     /**
      * The maximum number of simultaneous touch contacts supported by the device.
@@ -802,37 +826,19 @@ class nsIWidget : public nsISupports {
      * popup widgets the returned rect is in screen coordinates and not
      * relative to its parent widget.
      *
-     * The untyped version exists temporarily to ease conversion to typed
-     * coordinates.
-     *
      * @param aRect   On return it holds the  x, y, width and height of
      *                this widget.
      */
-    NS_IMETHOD GetBounds(mozilla::LayoutDeviceIntRect &aRect) {
-      nsIntRect tmp;
-      nsresult rv = GetBoundsUntyped(tmp);
-      aRect = mozilla::LayoutDeviceIntRect::FromUnknownRect(tmp);
-      return rv;
-    }
-    NS_IMETHOD GetBoundsUntyped(nsIntRect &aRect) = 0;
+    NS_IMETHOD GetBounds(LayoutDeviceIntRect& aRect) = 0;
 
     /**
      * Get this widget's outside dimensions in global coordinates. This
      * includes any title bar on the window.
      *
-     * The untyped version exists temporarily to ease conversion to typed
-     * coordinates.
-     *
      * @param aRect   On return it holds the  x, y, width and height of
      *                this widget.
      */
-    NS_IMETHOD GetScreenBounds(mozilla::LayoutDeviceIntRect &aRect) {
-      nsIntRect tmp;
-      nsresult rv = GetScreenBoundsUntyped(tmp);
-      aRect = mozilla::LayoutDeviceIntRect::FromUnknownRect(tmp);
-      return rv;
-    }
-    NS_IMETHOD GetScreenBoundsUntyped(nsIntRect &aRect) = 0;
+    NS_IMETHOD GetScreenBounds(LayoutDeviceIntRect& aRect) = 0;
 
     /**
      * Similar to GetScreenBounds except that this function will always
@@ -843,19 +849,10 @@ class nsIWidget : public nsISupports {
      * This method will always succeed if the current size mode is
      * nsSizeMode_Normal.
      *
-     * The untyped version exists temporarily to ease conversion to typed
-     * coordinates.
-     *
      * @param aRect   On return it holds the  x, y, width and height of
      *                this widget.
      */
-    NS_IMETHOD GetRestoredBounds(mozilla::LayoutDeviceIntRect &aRect) {
-      nsIntRect tmp;
-      nsresult rv = GetRestoredBoundsUntyped(tmp);
-      aRect = mozilla::LayoutDeviceIntRect::FromUnknownRect(tmp);
-      return rv;
-    }
-    NS_IMETHOD GetRestoredBoundsUntyped(nsIntRect &aRect) = 0;
+    NS_IMETHOD GetRestoredBounds(mozilla::LayoutDeviceIntRect& aRect) = 0;
 
     /**
      * Get this widget's client area bounds, if the window has a 3D border
@@ -863,25 +860,15 @@ class nsIWidget : public nsISupports {
      * position of the client area relative to the client area of the parent
      * widget (for root widgets and popup widgets it is in screen coordinates).
      *
-     * The untyped version exists temporarily to ease conversion to typed
-     * coordinates.
-     *
      * @param aRect   On return it holds the  x. y, width and height of
      *                the client area of this widget.
      */
-    NS_IMETHOD GetClientBounds(mozilla::LayoutDeviceIntRect &aRect) {
-      nsIntRect tmp;
-      nsresult rv = GetClientBoundsUntyped(tmp);
-      aRect = mozilla::LayoutDeviceIntRect::FromUnknownRect(tmp);
-      return rv;
-    }
-    NS_IMETHOD GetClientBoundsUntyped(nsIntRect &aRect) = 0;
+    NS_IMETHOD GetClientBounds(mozilla::LayoutDeviceIntRect& aRect) = 0;
 
     /**
      * Get the non-client area dimensions of the window.
-     * 
      */
-    NS_IMETHOD GetNonClientMargins(nsIntMargin &margins) = 0;
+    NS_IMETHOD GetNonClientMargins(LayoutDeviceIntMargin& aMargins) = 0;
 
     /**
      * Sets the non-client area dimensions of the window. Pass -1 to restore
@@ -895,26 +882,24 @@ class nsIWidget : public nsISupports {
      *  dimensions between zero and size < system default.
      *
      */
-    NS_IMETHOD SetNonClientMargins(nsIntMargin &margins) = 0;
+    NS_IMETHOD SetNonClientMargins(LayoutDeviceIntMargin& aMargins) = 0;
 
     /**
      * Get the client offset from the window origin.
      *
      * @return the x and y of the offset.
-     *
      */
-    virtual nsIntPoint GetClientOffset() = 0;
-
+    virtual LayoutDeviceIntPoint GetClientOffset() = 0;
 
     /**
      * Equivalent to GetClientBounds but only returns the size.
      */
-    virtual mozilla::gfx::IntSize GetClientSize() {
-      // Dependeing on the backend, overloading this method may be useful if
-      // if requesting the client offset is expensive.
-      mozilla::LayoutDeviceIntRect rect;
+    virtual LayoutDeviceIntSize GetClientSize() {
+      // Depending on the backend, overloading this method may be useful if
+      // requesting the client offset is expensive.
+      LayoutDeviceIntRect rect;
       GetClientBounds(rect);
-      return mozilla::gfx::IntSize(rect.width, rect.height);
+      return rect.Size();
     }
 
     /**
@@ -1008,8 +993,8 @@ class nsIWidget : public nsISupports {
         nsCOMPtr<nsIWidget> mChild;
         uintptr_t mWindowID; // e10s specific, the unique plugin port id
         bool mVisible; // e10s specific, widget visibility
-        nsIntRect mBounds;
-        nsTArray<nsIntRect> mClipRegion;
+        LayoutDeviceIntRect mBounds;
+        nsTArray<LayoutDeviceIntRect> mClipRegion;
     };
 
     /**
@@ -1029,7 +1014,7 @@ class nsIWidget : public nsISupports {
      * moved in that order.
      */
     virtual nsresult ConfigureChildren(const nsTArray<Configuration>& aConfigurations) = 0;
-    virtual nsresult SetWindowClipRegion(const nsTArray<nsIntRect>& aRects,
+    virtual nsresult SetWindowClipRegion(const nsTArray<LayoutDeviceIntRect>& aRects,
                                          bool aIntersectWithExisting) = 0;
 
     /**
@@ -1037,7 +1022,7 @@ class nsIWidget : public nsISupports {
      * region. If this widget is not clipped, appends a single rectangle
      * (0, 0, bounds.width, bounds.height).
      */
-    virtual void GetWindowClipRegion(nsTArray<nsIntRect>* aRects) = 0;
+    virtual void GetWindowClipRegion(nsTArray<LayoutDeviceIntRect>* aRects) = 0;
 
     /**
      * Register or unregister native plugin widgets which receive Configuration
@@ -1173,7 +1158,7 @@ class nsIWidget : public nsISupports {
      * Invalidate a specified rect for a widget so that it will be repainted
      * later.
      */
-    NS_IMETHOD Invalidate(const nsIntRect & aRect) = 0;
+    NS_IMETHOD Invalidate(const LayoutDeviceIntRect& aRect) = 0;
 
     enum LayerManagerPersistence
     {
@@ -1250,14 +1235,16 @@ class nsIWidget : public nsISupports {
      *
      * Always called from the compositing thread.
      */
-    virtual void DrawWindowUnderlay(LayerManagerComposite* aManager, nsIntRect aRect) = 0;
+    virtual void DrawWindowUnderlay(LayerManagerComposite* aManager,
+                                    LayoutDeviceIntRect aRect) = 0;
 
     /**
      * Called after the LayerManager draws the layer tree
      *
      * Always called from the compositing thread.
      */
-    virtual void DrawWindowOverlay(LayerManagerComposite* aManager, nsIntRect aRect) = 0;
+    virtual void DrawWindowOverlay(LayerManagerComposite* aManager,
+                                   LayoutDeviceIntRect aRect) = 0;
 
     /**
      * Return a DrawTarget for the window which can be composited into.
@@ -1318,12 +1305,12 @@ class nsIWidget : public nsISupports {
      *
      * @param aOpaqueRegion the region of the window that is opaque.
      */
-    virtual void UpdateOpaqueRegion(const nsIntRegion &aOpaqueRegion) {}
+    virtual void UpdateOpaqueRegion(const LayoutDeviceIntRegion& aOpaqueRegion) {}
 
     /**
      * Informs the widget about the region of the window that is draggable.
      */
-    virtual void UpdateWindowDraggingRegion(const nsIntRegion& aRegion) {}
+    virtual void UpdateWindowDraggingRegion(const LayoutDeviceIntRegion& aRegion) {}
 
     /**
      * Tells the widget whether the given input block results in a swipe.
@@ -1366,24 +1353,19 @@ class nsIWidget : public nsISupports {
     NS_IMETHOD SetIcon(const nsAString& anIconSpec) = 0;
 
     /**
-     * Return this widget's origin in screen coordinates. The untyped version
-     * exists temporarily to ease conversion to typed coordinates.
+     * Return this widget's origin in screen coordinates.
      *
      * @return screen coordinates stored in the x,y members
      */
-
-    virtual mozilla::LayoutDeviceIntPoint WidgetToScreenOffset() = 0;
-    virtual nsIntPoint WidgetToScreenOffsetUntyped() {
-      return WidgetToScreenOffset().ToUnknownPoint();
-    }
+    virtual LayoutDeviceIntPoint WidgetToScreenOffset() = 0;
 
     /**
      * Given the specified client size, return the corresponding window size,
      * which includes the area for the borders and titlebar. This method
      * should work even when the window is not yet visible.
      */
-    virtual mozilla::LayoutDeviceIntSize ClientToWindowSize(
-                const mozilla::LayoutDeviceIntSize& aClientSize) = 0;
+    virtual LayoutDeviceIntSize ClientToWindowSize(
+                const LayoutDeviceIntSize& aClientSize) = 0;
 
     /**
      * Dispatches an event to the widget
@@ -1504,7 +1486,7 @@ class nsIWidget : public nsISupports {
      * @param aResizerRect The resizer's rect in device pixels.
      * @return Whether a resize widget is shown.
      */
-    virtual bool ShowsResizeIndicator(nsIntRect* aResizerRect) = 0;
+    virtual bool ShowsResizeIndicator(LayoutDeviceIntRect* aResizerRect) = 0;
 
     /**
      * Return the popup that was last rolled up, or null if there isn't one.
@@ -1586,7 +1568,7 @@ class nsIWidget : public nsISupports {
      * @param aObserver the observer that will get notified once the events
      * have been dispatched.
      */
-    virtual nsresult SynthesizeNativeMouseEvent(mozilla::LayoutDeviceIntPoint aPoint,
+    virtual nsresult SynthesizeNativeMouseEvent(LayoutDeviceIntPoint aPoint,
                                                 uint32_t aNativeMessage,
                                                 uint32_t aModifierFlags,
                                                 nsIObserver* aObserver) = 0;
@@ -1597,7 +1579,7 @@ class nsIWidget : public nsISupports {
      * @param aObserver the observer that will get notified once the events
      * have been dispatched.
      */
-    virtual nsresult SynthesizeNativeMouseMove(mozilla::LayoutDeviceIntPoint aPoint,
+    virtual nsresult SynthesizeNativeMouseMove(LayoutDeviceIntPoint aPoint,
                                                nsIObserver* aObserver) = 0;
 
     /**
@@ -1623,7 +1605,7 @@ class nsIWidget : public nsISupports {
      * @param aObserver         The observer that will get notified once the
      *                          events have been dispatched.
      */
-    virtual nsresult SynthesizeNativeMouseScrollEvent(mozilla::LayoutDeviceIntPoint aPoint,
+    virtual nsresult SynthesizeNativeMouseScrollEvent(LayoutDeviceIntPoint aPoint,
                                                       uint32_t aNativeMessage,
                                                       double aDeltaX,
                                                       double aDeltaY,
@@ -1670,7 +1652,7 @@ class nsIWidget : public nsISupports {
      */
     virtual nsresult SynthesizeNativeTouchPoint(uint32_t aPointerId,
                                                 TouchPointerState aPointerState,
-                                                nsIntPoint aPointerScreenPoint,
+                                                ScreenIntPoint aPointerScreenPoint,
                                                 double aPointerPressure,
                                                 uint32_t aPointerOrientation,
                                                 nsIObserver* aObserver) = 0;
@@ -1683,7 +1665,7 @@ class nsIWidget : public nsISupports {
      * @param aObserver The observer that will get notified once the events
      * have been dispatched.
      */
-    virtual nsresult SynthesizeNativeTouchTap(nsIntPoint aPointerScreenPoint,
+    virtual nsresult SynthesizeNativeTouchTap(ScreenIntPoint aPointerScreenPoint,
                                               bool aLongTap,
                                               nsIObserver* aObserver);
 
@@ -1719,7 +1701,7 @@ private:
   class LongTapInfo
   {
   public:
-    LongTapInfo(int32_t aPointerId, nsIntPoint& aPoint,
+    LongTapInfo(int32_t aPointerId, ScreenIntPoint& aPoint,
                 mozilla::TimeDuration aDuration,
                 nsIObserver* aObserver) :
       mPointerId(aPointerId),
@@ -1731,7 +1713,7 @@ private:
     }
 
     int32_t mPointerId;
-    nsIntPoint mPosition;
+    ScreenIntPoint mPosition;
     mozilla::TimeDuration mDuration;
     nsCOMPtr<nsIObserver> mObserver;
     mozilla::TimeStamp mStamp;
@@ -1817,6 +1799,13 @@ public:
      */
     NS_IMETHOD_(InputContext) GetInputContext() = 0;
 
+    /**
+     * Get native IME context.  This is different from GetNativeData() with
+     * NS_RAW_NATIVE_IME_CONTEXT, the result is unique even if in a remote
+     * process.
+     */
+    NS_IMETHOD_(NativeIMEContext) GetNativeIMEContext();
+
     /*
      * Given a WidgetKeyboardEvent, this method synthesizes a corresponding
      * native (OS-level) event for it. This method allows tests to simulate
@@ -1842,17 +1831,6 @@ public:
                         void* aCallbackData) = 0;
 
     /*
-     * Get toggled key states.
-     * aKeyCode should be NS_VK_CAPS_LOCK or  NS_VK_NUM_LOCK or
-     * NS_VK_SCROLL_LOCK.
-     * aLEDState is the result for current LED state of the key.
-     * If the LED is 'ON', it returns TRUE, otherwise, FALSE.
-     * If the platform doesn't support the LED state (or we cannot get the
-     * state), this method returns NS_ERROR_NOT_IMPLEMENTED.
-     */
-    NS_IMETHOD GetToggledKeyState(uint32_t aKeyCode, bool* aLEDState) = 0;
-
-    /*
      * Retrieves preference for IME updates
      */
     virtual nsIMEUpdatePreference GetIMEUpdatePreference() = 0;
@@ -1860,8 +1838,8 @@ public:
     /*
      * Call this method when a dialog is opened which has a default button.
      * The button's rectangle should be supplied in aButtonRect.
-     */ 
-    NS_IMETHOD OnDefaultButtonLoaded(const nsIntRect &aButtonRect) = 0;
+     */
+    NS_IMETHOD OnDefaultButtonLoaded(const LayoutDeviceIntRect& aButtonRect) = 0;
 
     /**
      * Compute the overridden system mouse scroll speed on the root content of
@@ -1953,7 +1931,7 @@ public:
        if (!IsVisible()) {
            return false;
        }
-       mozilla::LayoutDeviceIntRect bounds;
+       LayoutDeviceIntRect bounds;
        nsresult rv = GetBounds(bounds);
        NS_ENSURE_SUCCESS(rv, false);
        return !bounds.IsEmpty();
@@ -1970,17 +1948,10 @@ public:
      * No code outside of the composition pipeline should know or care
      * about this.  If you're not an agent of the compositor, you
      * probably shouldn't call this method.
-     *
-     * The untyped version exists temporarily to ease conversion to typed
-     * coordinates.
      */
-    virtual mozilla::LayoutDeviceIntRect GetNaturalBounds() {
-        nsIntRect tmp = GetNaturalBoundsUntyped();
-        return mozilla::LayoutDeviceIntRect::FromUnknownRect(tmp);
-    }
-    virtual nsIntRect GetNaturalBoundsUntyped() {
-        nsIntRect bounds;
-        GetBoundsUntyped(bounds);
+    virtual LayoutDeviceIntRect GetNaturalBounds() {
+        LayoutDeviceIntRect bounds;
+        GetBounds(bounds);
         return bounds;
     }
 

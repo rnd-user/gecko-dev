@@ -581,6 +581,7 @@ class InfluxRecordingMixin(object):
         self.recording = False
         self.post = None
         self.posturl = None
+        self.build_metrics_summary = None
         self.res_props = self.config.get('build_resources_path') % self.query_abs_dirs()
         self.info("build_resources.json path: %s" % self.res_props)
         if self.res_props:
@@ -697,8 +698,6 @@ class InfluxRecordingMixin(object):
 
     @PostScriptAction('build')
     def record_mach_stats(self, action, success=None):
-        if not self.recording:
-            return
         if not os.path.exists(self.res_props):
             self.info('No build_resources.json found, not logging stats')
             return
@@ -727,6 +726,7 @@ class InfluxRecordingMixin(object):
                     "cpu_percent",
                 ],
             }
+
             # The io and cpu_times fields aren't static - they may vary based
             # on the specific platform being measured. Mach records the field
             # names, which we use as the column names here.
@@ -735,6 +735,13 @@ class InfluxRecordingMixin(object):
             iolen = len(resources['io_fields'])
             cpulen = len(resources['cpu_times_fields'])
 
+            if 'duration' in resources:
+                self.build_metrics_summary = {
+                    'name': 'build times',
+                    'value': resources['duration'],
+                    'subtests': [],
+                }
+
             # The top-level data has the overall resource usage, which we record
             # under the name 'TOTAL' to separate it from the individual tiers.
             data['points'].append(self._get_resource_usage(resources, 'TOTAL', iolen, cpulen))
@@ -742,10 +749,19 @@ class InfluxRecordingMixin(object):
             # Each tier also has the same resource stats as the top-level.
             for tier in resources['tiers']:
                 data['points'].append(self._get_resource_usage(tier, tier['name'], iolen, cpulen))
+                if 'duration' not in tier:
+                    self.build_metrics_summary = None
+                elif self.build_metrics_summary:
+                    self.build_metrics_summary['subtests'].append({
+                        'name': tier['name'],
+                        'value': tier['duration'],
+                    })
 
             self.record_influx_stat([data])
 
     def record_influx_stat(self, json_data):
+        if not self.recording:
+            return
         try:
             r = self.post(self.posturl, data=json.dumps(json_data), timeout=5)
             if r.status_code != 200:

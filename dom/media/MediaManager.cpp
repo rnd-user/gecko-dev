@@ -98,18 +98,33 @@ struct nsIMediaDevice::COMTypeInfo<mozilla::AudioDevice, void> {
 };
 const nsIID nsIMediaDevice::COMTypeInfo<mozilla::AudioDevice, void>::kIID = NS_IMEDIADEVICE_IID;
 
+namespace {
+already_AddRefed<nsIAsyncShutdownClient> GetShutdownPhase() {
+  nsCOMPtr<nsIAsyncShutdownService> svc = services::GetAsyncShutdown();
+  MOZ_RELEASE_ASSERT(svc);
+
+  nsCOMPtr<nsIAsyncShutdownClient> shutdownPhase;
+  nsresult rv = svc->GetProfileBeforeChange(getter_AddRefs(shutdownPhase));
+  if (!shutdownPhase) {
+    // We are probably in a content process.
+    rv = svc->GetContentChildShutdown(getter_AddRefs(shutdownPhase));
+  }
+  MOZ_RELEASE_ASSERT(shutdownPhase);
+  MOZ_RELEASE_ASSERT(NS_SUCCEEDED(rv));
+  return shutdownPhase.forget();
+}
+}
+
 namespace mozilla {
 
 #ifdef LOG
 #undef LOG
 #endif
 
-PRLogModuleInfo*
+LogModule*
 GetMediaManagerLog()
 {
-  static PRLogModuleInfo *sLog;
-  if (!sLog)
-    sLog = PR_NewLogModule("MediaManager");
+  static LazyLogModule sLog("MediaManager");
   return sLog;
 }
 #define LOG(msg) MOZ_LOG(GetMediaManagerLog(), mozilla::LogLevel::Debug, msg)
@@ -1176,7 +1191,7 @@ MediaManager::SelectSettings(
     sources.Clear();
     const char* badConstraint = nullptr;
 
-    if (IsOn(aConstraints.mVideo)) {
+    if (videos.Length() && IsOn(aConstraints.mVideo)) {
       badConstraint = MediaConstraintsHelper::SelectSettings(
           GetInvariant(aConstraints.mVideo), videos);
       for (auto& video : videos) {
@@ -1412,6 +1427,8 @@ MediaManager::EnumerateRawDevices(uint64_t aWindowId,
                                   bool aFake, bool aFakeTracks)
 {
   MOZ_ASSERT(NS_IsMainThread());
+  MOZ_ASSERT(aVideoType != MediaSourceEnum::Other ||
+             aAudioType != MediaSourceEnum::Other);
   RefPtr<PledgeSourceSet> p = new PledgeSourceSet();
   uint32_t id = mOutstandingPledges.Append(*p);
 
@@ -1437,30 +1454,39 @@ MediaManager::EnumerateRawDevices(uint64_t aWindowId,
                                                  videoLoopDev, aVideoType,
                                                  aAudioType, aFake,
                                                  aFakeTracks]() mutable {
-    RefPtr<MediaEngine> backend;
-    if (aFake) {
-      backend = new MediaEngineDefault(aFakeTracks);
-    } else {
+    // Only enumerate what's asked for, and only fake cams and mics.
+    bool hasVideo = aVideoType != MediaSourceEnum::Other;
+    bool hasAudio = aAudioType != MediaSourceEnum::Other;
+    bool fakeCams = aFake && aVideoType == MediaSourceEnum::Camera;
+    bool fakeMics = aFake && aAudioType == MediaSourceEnum::Microphone;
+
+    RefPtr<MediaEngine> fakeBackend, realBackend;
+    if (fakeCams || fakeMics) {
+      fakeBackend = new MediaEngineDefault(aFakeTracks);
+    }
+    if ((!fakeCams && hasVideo) || (!fakeMics && hasAudio)) {
       RefPtr<MediaManager> manager = MediaManager_GetInstance();
-      backend = manager->GetBackend(aWindowId);
+      realBackend = manager->GetBackend(aWindowId);
     }
 
     ScopedDeletePtr<SourceSet> result(new SourceSet);
 
-    nsTArray<RefPtr<VideoDevice>> videos;
-    GetSources(backend, aVideoType, &MediaEngine::EnumerateVideoDevices, videos,
-               videoLoopDev);
-    for (auto& source : videos) {
-      result->AppendElement(source);
+    if (hasVideo) {
+      nsTArray<RefPtr<VideoDevice>> videos;
+      GetSources(fakeCams? fakeBackend : realBackend, aVideoType,
+                 &MediaEngine::EnumerateVideoDevices, videos, videoLoopDev);
+      for (auto& source : videos) {
+        result->AppendElement(source);
+      }
     }
-
-    nsTArray<RefPtr<AudioDevice>> audios;
-    GetSources(backend, aAudioType,
-               &MediaEngine::EnumerateAudioDevices, audios, audioLoopDev);
-    for (auto& source : audios) {
-      result->AppendElement(source);
+    if (hasAudio) {
+      nsTArray<RefPtr<AudioDevice>> audios;
+      GetSources(fakeMics? fakeBackend : realBackend, aAudioType,
+                 &MediaEngine::EnumerateAudioDevices, audios, audioLoopDev);
+      for (auto& source : audios) {
+        result->AppendElement(source);
+      }
     }
-
     SourceSet* handoff = result.forget();
     NS_DispatchToMainThread(do_AddRef(NewRunnableFrom([id, handoff]() mutable {
       ScopedDeletePtr<SourceSet> result(handoff); // grab result
@@ -1473,14 +1499,13 @@ MediaManager::EnumerateRawDevices(uint64_t aWindowId,
         p->Resolve(result.forget());
       }
       return NS_OK;
-          })));
+    })));
   }));
   return p.forget();
 }
 
 MediaManager::MediaManager()
   : mMediaThread(nullptr)
-  , mMutex("mozilla::MediaManager")
   , mBackend(nullptr) {
   mPrefs.mFreq   = 1000; // 1KHz test tone
   mPrefs.mWidth  = 0; // adaptive default
@@ -1544,7 +1569,6 @@ MediaManager::Get() {
 
     nsCOMPtr<nsIObserverService> obs = services::GetObserverService();
     if (obs) {
-      obs->AddObserver(sSingleton, "xpcom-will-shutdown", false);
       obs->AddObserver(sSingleton, "last-pb-context-exited", false);
       obs->AddObserver(sSingleton, "getUserMedia:privileged:allow", false);
       obs->AddObserver(sSingleton, "getUserMedia:response:allow", false);
@@ -1563,13 +1587,7 @@ MediaManager::Get() {
 
     // Prepare async shutdown
 
-    nsCOMPtr<nsIAsyncShutdownClient> profileBeforeChange;
-    {
-      nsCOMPtr<nsIAsyncShutdownService> svc = services::GetAsyncShutdown();
-      MOZ_RELEASE_ASSERT(svc);
-      nsresult rv = svc->GetProfileBeforeChange(getter_AddRefs(profileBeforeChange));
-      MOZ_RELEASE_ASSERT(NS_SUCCEEDED(rv));
-    }
+    nsCOMPtr<nsIAsyncShutdownClient> shutdownPhase = GetShutdownPhase();
 
     class Blocker : public media::ShutdownBlocker
     {
@@ -1578,7 +1596,7 @@ MediaManager::Get() {
       : media::ShutdownBlocker(NS_LITERAL_STRING(
           "Media shutdown: blocking on media thread")) {}
 
-      NS_IMETHOD BlockShutdown(nsIAsyncShutdownClient* aProfileBeforeChange) override
+      NS_IMETHOD BlockShutdown(nsIAsyncShutdownClient*) override
       {
         MOZ_RELEASE_ASSERT(MediaManager::GetIfExists());
         MediaManager::GetIfExists()->Shutdown();
@@ -1587,10 +1605,10 @@ MediaManager::Get() {
     };
 
     sSingleton->mShutdownBlocker = new Blocker();
-    nsresult rv = profileBeforeChange->AddBlocker(sSingleton->mShutdownBlocker,
-                                                  NS_LITERAL_STRING(__FILE__),
-                                                  __LINE__,
-                                                  NS_LITERAL_STRING("Media shutdown"));
+    nsresult rv = shutdownPhase->AddBlocker(sSingleton->mShutdownBlocker,
+                                            NS_LITERAL_STRING(__FILE__),
+                                            __LINE__,
+                                            NS_LITERAL_STRING("Media shutdown"));
     MOZ_RELEASE_ASSERT(NS_SUCCEEDED(rv));
 #ifdef MOZ_B2G
     // Init MediaPermissionManager before sending out any permission requests.
@@ -1859,8 +1877,8 @@ MediaManager::GetUserMedia(nsPIDOMWindow* aWindow,
     c.mVideo.SetAsBoolean() = false;
   }
 
-  MediaSourceEnum videoType = dom::MediaSourceEnum::Camera;
-  MediaSourceEnum audioType = dom::MediaSourceEnum::Microphone;
+  MediaSourceEnum videoType = dom::MediaSourceEnum::Other; // none
+  MediaSourceEnum audioType = dom::MediaSourceEnum::Other; // none
 
   if (c.mVideo.IsMediaTrackConstraints()) {
     auto& vc = c.mVideo.GetAsMediaTrackConstraints();
@@ -1963,6 +1981,8 @@ MediaManager::GetUserMedia(nsPIDOMWindow* aWindow,
                  videoType == dom::MediaSourceEnum::Screen)) {
        privileged = false;
     }
+  } else if (IsOn(c.mVideo)) {
+    videoType = dom::MediaSourceEnum::Camera;
   }
 
   if (c.mAudio.IsMediaTrackConstraints()) {
@@ -2017,7 +2037,10 @@ MediaManager::GetUserMedia(nsPIDOMWindow* aWindow,
         }
       }
     }
+  } else if (IsOn(c.mAudio)) {
+   audioType = dom::MediaSourceEnum::Microphone;
   }
+
   StreamListeners* listeners = AddWindowID(windowID);
 
   // Create a disabled listener to act as a placeholder
@@ -2080,8 +2103,8 @@ MediaManager::GetUserMedia(nsPIDOMWindow* aWindow,
       (!fake || Preferences::GetBool("media.navigator.permission.fake"));
 
   RefPtr<PledgeSourceSet> p = EnumerateDevicesImpl(windowID, videoType,
-                                                     audioType, fake,
-                                                     fakeTracks);
+                                                   audioType, fake,
+                                                   fakeTracks);
   p->Then([this, onSuccess, onFailure, windowID, c, listener, askPermission,
            prefs, isHTTPS, callID, origin](SourceSet*& aDevices) mutable {
 
@@ -2301,8 +2324,8 @@ MediaManager::EnumerateDevicesImpl(uint64_t aWindowId,
     RefPtr<MediaManager> mgr = MediaManager_GetInstance();
 
     RefPtr<PledgeSourceSet> p = mgr->EnumerateRawDevices(aWindowId,
-                                                           aVideoType, aAudioType,
-                                                           aFake, aFakeTracks);
+                                                         aVideoType, aAudioType,
+                                                         aFake, aFakeTracks);
     p->Then([id, aWindowId, aOriginKey](SourceSet*& aDevices) mutable {
       ScopedDeletePtr<SourceSet> devices(aDevices); // secondary result
 
@@ -2402,10 +2425,10 @@ MediaManager::GetUserMediaDevices(nsPIDOMWindow* aWindow,
 MediaEngine*
 MediaManager::GetBackend(uint64_t aWindowId)
 {
+  MOZ_ASSERT(MediaManager::IsInMediaThread());
   // Plugin backends as appropriate. The default engine also currently
   // includes picture support for Android.
   // This IS called off main-thread.
-  MutexAutoLock lock(mMutex);
   if (!mBackend) {
     MOZ_RELEASE_ASSERT(!sInShutdown);  // we should never create a new backend in shutdown
 #if defined(MOZ_WEBRTC)
@@ -2582,7 +2605,6 @@ MediaManager::Shutdown()
 
   nsCOMPtr<nsIObserverService> obs = services::GetObserverService();
 
-  obs->RemoveObserver(this, "xpcom-will-shutdown");
   obs->RemoveObserver(this, "last-pb-context-exited");
   obs->RemoveObserver(this, "getUserMedia:privileged:allow");
   obs->RemoveObserver(this, "getUserMedia:response:allow");
@@ -2602,12 +2624,6 @@ MediaManager::Shutdown()
   GetActiveWindows()->Clear();
   mActiveCallbacks.Clear();
   mCallIds.Clear();
-  {
-    MutexAutoLock lock(mMutex);
-    if (mBackend) {
-      mBackend->Shutdown(); // ok to invoke multiple times
-    }
-  }
 
   // Because mMediaThread is not an nsThread, we must dispatch to it so it can
   // clean up BackgroundChild. Continue stopping thread once this is done.
@@ -2615,26 +2631,32 @@ MediaManager::Shutdown()
   class ShutdownTask : public Task
   {
   public:
-    ShutdownTask(already_AddRefed<MediaEngine> aBackend,
+    ShutdownTask(MediaManager* aManager,
                  nsRunnable* aReply)
-      : mReply(aReply)
-      , mBackend(aBackend) {}
+      : mManager(aManager)
+      , mReply(aReply) {}
   private:
     virtual void
     Run()
     {
       LOG(("MediaManager Thread Shutdown"));
       MOZ_ASSERT(MediaManager::IsInMediaThread());
+      // Must shutdown backend on MediaManager thread, since that's where we started it from!
+      {
+        if (mManager->mBackend) {
+          mManager->mBackend->Shutdown(); // ok to invoke multiple times
+        }
+      }
       mozilla::ipc::BackgroundChild::CloseForCurrentThread();
       // must explicitly do this before dispatching the reply, since the reply may kill us with Stop()
-      mBackend = nullptr; // last reference, will invoke Shutdown() again
+      mManager->mBackend = nullptr; // last reference, will invoke Shutdown() again
 
       if (NS_FAILED(NS_DispatchToMainThread(mReply.forget()))) {
         LOG(("Will leak thread: DispatchToMainthread of reply runnable failed in MediaManager shutdown"));
       }
     }
+    RefPtr<MediaManager> mManager;
     RefPtr<nsRunnable> mReply;
-    RefPtr<MediaEngine> mBackend;
   };
 
   // Post ShutdownTask to execute on mMediaThread and pass in a lambda
@@ -2647,14 +2669,8 @@ MediaManager::Shutdown()
   // note that this == sSingleton
   RefPtr<MediaManager> that(sSingleton);
   // Release the backend (and call Shutdown()) from within the MediaManager thread
-  RefPtr<MediaEngine> temp;
-  {
-    MutexAutoLock lock(mMutex);
-    temp = mBackend.forget();
-  }
   // Don't use MediaManager::PostTask() because we're sInShutdown=true here!
-  mMediaThread->message_loop()->PostTask(FROM_HERE, new ShutdownTask(
-      temp.forget(),
+  mMediaThread->message_loop()->PostTask(FROM_HERE, new ShutdownTask(this,
       media::NewRunnableFrom([this, that]() mutable {
     LOG(("MediaManager shutdown lambda running, releasing MediaManager singleton and thread"));
     if (mMediaThread) {
@@ -2663,14 +2679,8 @@ MediaManager::Shutdown()
 
     // Remove async shutdown blocker
 
-    nsCOMPtr<nsIAsyncShutdownClient> profileBeforeChange;
-    {
-      nsCOMPtr<nsIAsyncShutdownService> svc = services::GetAsyncShutdown();
-      MOZ_RELEASE_ASSERT(svc);
-      nsresult rv = svc->GetProfileBeforeChange(getter_AddRefs(profileBeforeChange));
-      MOZ_RELEASE_ASSERT(NS_SUCCEEDED(rv));
-    }
-    profileBeforeChange->RemoveBlocker(sSingleton->mShutdownBlocker);
+    nsCOMPtr<nsIAsyncShutdownClient> shutdownPhase = GetShutdownPhase();
+    shutdownPhase->RemoveBlocker(sSingleton->mShutdownBlocker);
 
     // we hold a ref to 'that' which is the same as sSingleton
     sSingleton = nullptr;
@@ -2692,9 +2702,6 @@ MediaManager::Observe(nsISupports* aSubject, const char* aTopic,
       LOG(("%s: %dx%d @%dfps (min %d)", __FUNCTION__,
            mPrefs.mWidth, mPrefs.mHeight, mPrefs.mFPS, mPrefs.mMinFPS));
     }
-  } else if (!strcmp(aTopic, "xpcom-will-shutdown")) {
-    Shutdown();
-    return NS_OK;
   } else if (!strcmp(aTopic, "last-pb-context-exited")) {
     // Clear memory of private-browsing-specific deviceIds. Fire and forget.
     media::SanitizeOriginKeys(0, true);

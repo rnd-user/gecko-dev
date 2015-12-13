@@ -273,8 +273,16 @@ public:
       } else {
         mode = ExtendMode::REPEAT;
       }
+
+      Filter filter;
+      if (state.imageSmoothingEnabled) {
+        filter = Filter::GOOD;
+      } else {
+        filter = Filter::POINT;
+      }
+
       mPattern.InitSurfacePattern(state.patternStyles[aStyle]->mSurface, mode,
-                                  state.patternStyles[aStyle]->mTransform);
+                                  state.patternStyles[aStyle]->mTransform, filter);
     }
 
     return *mPattern.GetPattern();
@@ -1196,13 +1204,20 @@ bool CanvasRenderingContext2D::SwitchRenderingMode(RenderingMode aRenderingMode)
   }
 
 #ifdef USE_SKIA_GPU
+  // Do not attempt to switch into GL mode if the platform doesn't allow it.
+  if ((aRenderingMode == RenderingMode::OpenGLBackendMode) &&
+      (!gfxPlatform::GetPlatform()->HaveChoiceOfHWAndSWCanvas() ||
+       !gfxPlatform::GetPlatform()->UseAcceleratedSkiaCanvas())) {
+      return false;
+  }
+
   if (mRenderingMode == RenderingMode::OpenGLBackendMode) {
     if (mVideoTexture) {
       gfxPlatform::GetPlatform()->GetSkiaGLGlue()->GetGLContext()->MakeCurrent();
       gfxPlatform::GetPlatform()->GetSkiaGLGlue()->GetGLContext()->fDeleteTextures(1, &mVideoTexture);
     }
-	  mCurrentVideoSize.width = 0;
-	  mCurrentVideoSize.height = 0;
+    mCurrentVideoSize.width = 0;
+    mCurrentVideoSize.height = 0;
   }
 #endif
 
@@ -1896,7 +1911,7 @@ CanvasRenderingContext2D::SetMozCurrentTransform(JSContext* cx,
   }
 
   Matrix newCTM;
-  if (ObjectToMatrix(cx, currentTransform, newCTM, error)) {
+  if (ObjectToMatrix(cx, currentTransform, newCTM, error) && newCTM.IsFinite()) {
     mTarget->SetTransform(newCTM);
   }
 }
@@ -1924,7 +1939,7 @@ CanvasRenderingContext2D::SetMozCurrentTransformInverse(JSContext* cx,
   Matrix newCTMInverse;
   if (ObjectToMatrix(cx, currentTransform, newCTMInverse, error)) {
     // XXX ERRMSG we need to report an error to developers here! (bug 329026)
-    if (newCTMInverse.Invert()) {
+    if (newCTMInverse.Invert() && newCTMInverse.IsFinite()) {
       mTarget->SetTransform(newCTMInverse);
     }
   }
@@ -2105,15 +2120,14 @@ CanvasRenderingContext2D::CreatePattern(const CanvasImageSource& source,
     nsLayoutUtils::SurfaceFromElement(htmlElement,
       nsLayoutUtils::SFE_WANT_FIRST_FRAME, mTarget);
 
-  if (!res.mSourceSurface) {
+  if (!res.GetSourceSurface()) {
     error.Throw(NS_ERROR_NOT_AVAILABLE);
     return nullptr;
   }
 
-  RefPtr<CanvasPattern> pat =
-    new CanvasPattern(this, res.mSourceSurface, repeatMode, res.mPrincipal,
-                             res.mIsWriteOnly, res.mCORSUsed);
-
+  RefPtr<CanvasPattern> pat = new CanvasPattern(this, res.GetSourceSurface(), repeatMode,
+                                                res.mPrincipal, res.mIsWriteOnly,
+                                                res.mCORSUsed);
   return pat.forget();
 }
 
@@ -2473,14 +2487,24 @@ CanvasRenderingContext2D::UpdateFilter()
 // rects
 //
 
-// bug 1074733
-// The canvas spec does not forbid rects with negative w or h, so given
-// corners (x, y), (x+w, y), (x+w, y+h), and (x, y+h) we must generate
-// the appropriate rect by flipping negative dimensions. This prevents
-// draw targets from receiving "empty" rects later on.
-static void
-NormalizeRect(double& aX, double& aY, double& aWidth, double& aHeight)
+static bool
+ValidateRect(double& aX, double& aY, double& aWidth, double& aHeight)
 {
+
+  // bug 1018527
+  // The values of canvas API input are in double precision, but Moz2D APIs are
+  // using float precision. Bypass canvas API calls when the input is out of
+  // float precision to avoid precision problem
+  if (!std::isfinite((float)aX) | !std::isfinite((float)aY) |
+      !std::isfinite((float)aWidth) | !std::isfinite((float)aHeight)) {
+    return false;
+  }
+
+  // bug 1074733
+  // The canvas spec does not forbid rects with negative w or h, so given
+  // corners (x, y), (x+w, y), (x+w, y+h), and (x, y+h) we must generate
+  // the appropriate rect by flipping negative dimensions. This prevents
+  // draw targets from receiving "empty" rects later on.
   if (aWidth < 0) {
     aWidth = -aWidth;
     aX -= aWidth;
@@ -2489,13 +2513,16 @@ NormalizeRect(double& aX, double& aY, double& aWidth, double& aHeight)
     aHeight = -aHeight;
     aY -= aHeight;
   }
+  return true;
 }
 
 void
 CanvasRenderingContext2D::ClearRect(double x, double y, double w,
                                     double h)
 {
-  NormalizeRect(x, y, w, h);
+  if(!ValidateRect(x, y, w, h)) {
+    return;
+  }
 
   EnsureTarget();
 
@@ -2510,7 +2537,9 @@ CanvasRenderingContext2D::FillRect(double x, double y, double w,
 {
   const ContextState &state = CurrentState();
 
-  NormalizeRect(x, y, w, h);
+  if(!ValidateRect(x, y, w, h)) {
+    return;
+  }
 
   if (state.patternStyles[Style::FILL]) {
     CanvasPattern::RepeatMode repeat =
@@ -2585,7 +2614,10 @@ CanvasRenderingContext2D::StrokeRect(double x, double y, double w,
   if (!w && !h) {
     return;
   }
-  NormalizeRect(x, y, w, h);
+
+  if(!ValidateRect(x, y, w, h)) {
+    return;
+  }
 
   EnsureTarget();
   if (!IsTargetValid()) {
@@ -3967,16 +3999,20 @@ gfxFontGroup *CanvasRenderingContext2D::GetCurrentFontStyle()
     nsCOMPtr<nsIPresShell> presShell = GetPresShell();
     bool fontUpdated = SetFontInternal(kDefaultFontStyle, err);
     if (err.Failed() || !fontUpdated) {
+      err.SuppressException();
       gfxFontStyle style;
       style.size = kDefaultFontSize;
       gfxTextPerfMetrics* tp = nullptr;
       if (presShell && !presShell->IsDestroying()) {
         tp = presShell->GetPresContext()->GetTextPerfMetrics();
       }
+      int32_t perDevPixel, perCSSPixel;
+      GetAppUnitsValues(&perDevPixel, &perCSSPixel);
+      gfxFloat devToCssSize = gfxFloat(perDevPixel) / gfxFloat(perCSSPixel);
       CurrentState().fontGroup =
         gfxPlatform::GetPlatform()->CreateFontGroup(FontFamilyList(eFamily_sans_serif),
                                                     &style, tp,
-                                                    nullptr);
+                                                    nullptr, devToCssSize);
       if (CurrentState().fontGroup) {
         CurrentState().font = kDefaultFontStyle;
       } else {
@@ -4357,8 +4393,10 @@ CanvasRenderingContext2D::DrawImage(const CanvasImageSource& image,
   MOZ_ASSERT(optional_argc == 0 || optional_argc == 2 || optional_argc == 6);
 
   if (optional_argc == 6) {
-    NormalizeRect(sx, sy, sw, sh);
-    NormalizeRect(dx, dy, dw, dh);
+    if (!ValidateRect(sx, sy, sw, sh) ||
+        !ValidateRect(dx, dy, dw, dh)) {
+      return;
+    }
   }
 
   RefPtr<SourceSurface> srcSurf;
@@ -5190,7 +5228,9 @@ CanvasRenderingContext2D::GetImageDataArray(JSContext* aCx,
   }
 
   JS::AutoCheckCannotGC nogc;
-  uint8_t* data = JS_GetUint8ClampedArrayData(darray, nogc);
+  bool isShared;
+  uint8_t* data = JS_GetUint8ClampedArrayData(darray, &isShared, nogc);
+  MOZ_ASSERT(!isShared);        // Should not happen, data was created above
   if (!readback) {
     src = data;
     srcStride = aWidth * 4;
@@ -5395,9 +5435,9 @@ CanvasRenderingContext2D::PutImageData_explicit(int32_t x, int32_t y, uint32_t w
   uint8_t* srcLine = aArray->Data() + copyY * (w * 4) + copyX * 4;
 #if 0
   printf("PutImageData_explicit: dirty x=%d y=%d w=%d h=%d copy x=%d y=%d w=%d h=%d ext x=%d y=%d w=%d h=%d\n",
-	     dirtyRect.x, dirtyRect.y, copyWidth, copyHeight,
-	     copyX, copyY, copyWidth, copyHeight,
-	     x, y, w, h);
+       dirtyRect.x, dirtyRect.y, copyWidth, copyHeight,
+       copyX, copyY, copyWidth, copyHeight,
+       x, y, w, h);
 #endif
   for (uint32_t j = 0; j < copyHeight; j++) {
     uint8_t *src = srcLine;

@@ -118,8 +118,8 @@ Http2Session::Http2Session(nsISocketTransport *aSocketTransport, uint32_t versio
 
   LOG3(("Http2Session::Http2Session %p serial=0x%X\n", this, mSerial));
 
-  mInputFrameBuffer = new char[mInputFrameBufferSize];
-  mOutputQueueBuffer = new char[mOutputQueueSize];
+  mInputFrameBuffer = MakeUnique<char[]>(mInputFrameBufferSize);
+  mOutputQueueBuffer = MakeUnique<char[]>(mOutputQueueSize);
   mDecompressBuffer.SetCapacity(kDefaultBufferSize);
   mDecompressor.SetCompressor(&mCompressor);
 
@@ -594,6 +594,7 @@ Http2Session::ResetDownstreamState()
     mInputFrameDataStream->SetRecvdFin(true);
     MaybeDecrementConcurrent(mInputFrameDataStream);
   }
+  mInputFrameFinal = false;
   mInputFrameBufferUsed = 0;
   mInputFrameDataStream = nullptr;
 }
@@ -1093,8 +1094,8 @@ Http2Session::CleanupStream(uint32_t aID, nsresult aResult, errorType aResetCode
 
 static void RemoveStreamFromQueue(Http2Stream *aStream, nsDeque &queue)
 {
-  uint32_t size = queue.GetSize();
-  for (uint32_t count = 0; count < size; ++count) {
+  size_t size = queue.GetSize();
+  for (size_t count = 0; count < size; ++count) {
     Http2Stream *stream = static_cast<Http2Stream *>(queue.PopFront());
     if (stream != aStream)
       queue.Push(stream);
@@ -1153,7 +1154,7 @@ nsresult
 Http2Session::ParsePadding(uint8_t &paddingControlBytes, uint16_t &paddingLength)
 {
   if (mInputFrameFlags & kFlag_PADDED) {
-    paddingLength = *reinterpret_cast<uint8_t *>(mInputFrameBuffer + kFrameHeaderBytes);
+    paddingLength = *reinterpret_cast<uint8_t *>(&mInputFrameBuffer[kFrameHeaderBytes]);
     paddingControlBytes = 1;
   } else {
     paddingLength = 0;
@@ -1234,7 +1235,7 @@ Http2Session::RecvHeaders(Http2Session *self)
     if (self->mInputFrameID >= self->mNextStreamID)
       self->GenerateRstStream(PROTOCOL_ERROR, self->mInputFrameID);
 
-    self->mDecompressBuffer.Append(self->mInputFrameBuffer + kFrameHeaderBytes + paddingControlBytes + priorityLen,
+    self->mDecompressBuffer.Append(&self->mInputFrameBuffer[kFrameHeaderBytes + paddingControlBytes + priorityLen],
                                    self->mInputFrameDataSize - paddingControlBytes - priorityLen - paddingLength);
 
     if (self->mInputFrameFlags & kFlag_END_HEADERS) {
@@ -1261,7 +1262,7 @@ Http2Session::RecvHeaders(Http2Session *self)
   }
 
   // queue up any compression bytes
-  self->mDecompressBuffer.Append(self->mInputFrameBuffer + kFrameHeaderBytes + paddingControlBytes + priorityLen,
+  self->mDecompressBuffer.Append(&self->mInputFrameBuffer[kFrameHeaderBytes + paddingControlBytes + priorityLen],
                                  self->mInputFrameDataSize - paddingControlBytes - priorityLen - paddingLength);
 
   self->mInputFrameDataStream->UpdateTransportReadEvents(self->mInputFrameDataSize);
@@ -1645,7 +1646,7 @@ Http2Session::RecvPushPromise(Http2Session *self)
   if (resetStream) {
     // Need to decompress the headers even though we aren't using them yet in
     // order to keep the compression context consistent for other frames
-    self->mDecompressBuffer.Append(self->mInputFrameBuffer + kFrameHeaderBytes + paddingControlBytes + promiseLen,
+    self->mDecompressBuffer.Append(&self->mInputFrameBuffer[kFrameHeaderBytes + paddingControlBytes + promiseLen],
                                    self->mInputFrameDataSize - paddingControlBytes - promiseLen - paddingLength);
     if (self->mInputFrameFlags & kFlag_END_PUSH_PROMISE) {
       rv = self->UncompressAndDiscard();
@@ -1659,7 +1660,7 @@ Http2Session::RecvPushPromise(Http2Session *self)
     return NS_OK;
   }
 
-  self->mDecompressBuffer.Append(self->mInputFrameBuffer + kFrameHeaderBytes + paddingControlBytes + promiseLen,
+  self->mDecompressBuffer.Append(&self->mInputFrameBuffer[kFrameHeaderBytes + paddingControlBytes + promiseLen],
                                  self->mInputFrameDataSize - paddingControlBytes - promiseLen - paddingLength);
 
   if (!(self->mInputFrameFlags & kFlag_END_PUSH_PROMISE)) {
@@ -1841,8 +1842,8 @@ Http2Session::RecvGoAway(Http2Session *self)
   self->mStreamTransactionHash.Enumerate(GoAwayEnumerator, self);
 
   // Process the streams marked for deletion and restart.
-  uint32_t size = self->mGoAwayStreamsToRestart.GetSize();
-  for (uint32_t count = 0; count < size; ++count) {
+  size_t size = self->mGoAwayStreamsToRestart.GetSize();
+  for (size_t count = 0; count < size; ++count) {
     Http2Stream *stream =
       static_cast<Http2Stream *>(self->mGoAwayStreamsToRestart.PopFront());
 
@@ -1859,7 +1860,7 @@ Http2Session::RecvGoAway(Http2Session *self)
   // in another one. (they were never sent on the network so they implicitly
   // are not covered by the last-good id.
   size = self->mQueuedStreams.GetSize();
-  for (uint32_t count = 0; count < size; ++count) {
+  for (size_t count = 0; count < size; ++count) {
     Http2Stream *stream =
       static_cast<Http2Stream *>(self->mQueuedStreams.PopFront());
     MOZ_ASSERT(stream->Queued());
@@ -2502,7 +2503,7 @@ Http2Session::WriteSegments(nsAHttpSegmentWriter *writer,
     MOZ_ASSERT(mInputFrameBufferUsed < kFrameHeaderBytes,
                "Frame Buffer Used Too Large for State");
 
-    rv = NetworkRead(writer, mInputFrameBuffer + mInputFrameBufferUsed,
+    rv = NetworkRead(writer, &mInputFrameBuffer[mInputFrameBufferUsed],
                      kFrameHeaderBytes - mInputFrameBufferUsed, countWritten);
 
     if (NS_FAILED(rv)) {
@@ -2515,7 +2516,7 @@ Http2Session::WriteSegments(nsAHttpSegmentWriter *writer,
     }
 
     LogIO(this, nullptr, "Reading Frame Header",
-          mInputFrameBuffer + mInputFrameBufferUsed, *countWritten);
+          &mInputFrameBuffer[mInputFrameBufferUsed], *countWritten);
 
     mInputFrameBufferUsed += *countWritten;
 
@@ -2601,7 +2602,7 @@ Http2Session::WriteSegments(nsAHttpSegmentWriter *writer,
     MOZ_ASSERT(mInputFrameBufferUsed < (kFrameHeaderBytes + 1),
                "Frame buffer used too large for state");
 
-    rv = NetworkRead(writer, mInputFrameBuffer + mInputFrameBufferUsed,
+    rv = NetworkRead(writer, &mInputFrameBuffer[mInputFrameBufferUsed],
                      (kFrameHeaderBytes + 1) - mInputFrameBufferUsed,
                      countWritten);
 
@@ -2615,7 +2616,7 @@ Http2Session::WriteSegments(nsAHttpSegmentWriter *writer,
     }
 
     LogIO(this, nullptr, "Reading Data Frame Padding Control",
-          mInputFrameBuffer + mInputFrameBufferUsed, *countWritten);
+          &mInputFrameBuffer[mInputFrameBufferUsed], *countWritten);
 
     mInputFrameBufferUsed += *countWritten;
 
@@ -2628,7 +2629,7 @@ Http2Session::WriteSegments(nsAHttpSegmentWriter *writer,
 
     ++mInputFrameDataRead;
 
-    char *control = mInputFrameBuffer + kFrameHeaderBytes;
+    char *control = &mInputFrameBuffer[kFrameHeaderBytes];
     mPaddingLength = static_cast<uint8_t>(*control);
 
     LOG3(("Http2Session::WriteSegments %p stream 0x%X mPaddingLength=%d", this,
@@ -2790,7 +2791,7 @@ Http2Session::WriteSegments(nsAHttpSegmentWriter *writer,
   MOZ_ASSERT(mInputFrameDataSize + kFrameHeaderBytes <= mInputFrameBufferSize,
              "allocation for control frame insufficient");
 
-  rv = NetworkRead(writer, mInputFrameBuffer + kFrameHeaderBytes + mInputFrameDataRead,
+  rv = NetworkRead(writer, &mInputFrameBuffer[kFrameHeaderBytes + mInputFrameDataRead],
                    mInputFrameDataSize - mInputFrameDataRead, countWritten);
 
   if (NS_FAILED(rv)) {
@@ -2803,7 +2804,7 @@ Http2Session::WriteSegments(nsAHttpSegmentWriter *writer,
   }
 
   LogIO(this, nullptr, "Reading Control Frame",
-        mInputFrameBuffer + kFrameHeaderBytes + mInputFrameDataRead, *countWritten);
+        &mInputFrameBuffer[kFrameHeaderBytes + mInputFrameDataRead], *countWritten);
 
   mInputFrameDataRead += *countWritten;
 

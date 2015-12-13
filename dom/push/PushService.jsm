@@ -45,6 +45,8 @@ const prefs = new Preferences("dom.push.");
 
 const kCHILD_PROCESS_MESSAGES = ["Push:Register", "Push:Unregister",
                                  "Push:Registration", "Push:RegisterEventNotificationListener",
+                                 "Push:NotificationForOriginShown",
+                                 "Push:NotificationForOriginClosed",
                                  "child-process-shutdown"];
 
 const PUSH_SERVICE_UNINIT = 0;
@@ -97,6 +99,11 @@ this.PushService = {
   _db: null,
   _options: null,
   _alarmID: null,
+  _visibleNotifications: new Map(),
+
+  // Callback that is called after attempting to
+  // reduce the quota for a record. Used for testing purposes.
+  _updateQuotaTestCallback: null,
 
   _childListeners: [],
 
@@ -270,35 +277,29 @@ this.PushService = {
         })
         break;
 
-      case "webapps-clear-data":
-        console.debug("webapps-clear-data");
-
-        let data = aSubject
-                     .QueryInterface(Ci.mozIApplicationClearPrivateDataParams);
-        if (!data) {
-          console.error("webapps-clear-data: Failed to get information " +
-            "about application");
-          return;
-        }
-
-        var originAttributes =
-          ChromeUtils.originAttributesToSuffix({ appId: data.appId,
-                                                 inBrowser: data.browserOnly });
-        this._db.getAllByOriginAttributes(originAttributes)
-          .then(records => Promise.all(records.map(record =>
-            this._db.delete(record.keyID)
-              .catch(err => {
-                console.error("webapps-clear-data: Error removing record",
-                  record, err);
-                // This is the record we were unable to delete.
-                return record;
-              })
-              .then(maybeDeleted => this._backgroundUnregister(maybeDeleted))
-            )
-          ));
-
+      case "clear-origin-data":
+        this._clearOriginData(aData).catch(error => {
+          console.error("clearOriginData: Error clearing origin data:", error);
+        });
         break;
     }
+  },
+
+  _clearOriginData: function(data) {
+    console.log("clearOriginData()");
+
+    if (!data) {
+      return Promise.resolve();
+    }
+
+    let pattern = JSON.parse(data);
+    return this._db.clearIf(record => {
+      if (!record.matchesOriginAttributes(pattern)) {
+        return false;
+      }
+      this._backgroundUnregister(record);
+      return true;
+    });
   },
 
   /**
@@ -480,7 +481,7 @@ this.PushService = {
       return;
     }
 
-    Services.obs.addObserver(this, "webapps-clear-data", false);
+    Services.obs.addObserver(this, "clear-origin-data", false);
 
     // On B2G the NetworkManager interface fires a network-active-changed
     // event.
@@ -607,7 +608,7 @@ this.PushService = {
     prefs.ignore("connection.enabled", this);
 
     Services.obs.removeObserver(this, this._networkStateChangeEventName);
-    Services.obs.removeObserver(this, "webapps-clear-data");
+    Services.obs.removeObserver(this, "clear-origin-data");
     Services.obs.removeObserver(this, "idle-daily");
     Services.obs.removeObserver(this, "perm-changed");
   },
@@ -786,17 +787,29 @@ this.PushService = {
     });
   },
 
-  ensureP256dhKey: function(record) {
-    if (record.p256dhPublicKey && record.p256dhPrivateKey) {
+  ensureCrypto: function(record) {
+    if (record.authenticationSecret &&
+        record.p256dhPublicKey &&
+        record.p256dhPrivateKey) {
       return Promise.resolve(record);
+    }
+
+    let keygen = Promise.resolve([]);
+    if (!record.p256dhPublicKey || !record.p256dhPrivateKey) {
+      keygen = PushCrypto.generateKeys();
     }
     // We do not have a encryption key. so we need to generate it. This
     // is only going to happen on db upgrade from version 4 to higher.
-    return PushCrypto.generateKeys()
-      .then(exportedKeys => {
+    return keygen
+      .then(([pubKey, privKey]) => {
         return this.updateRecordAndNotifyApp(record.keyID, record => {
-          record.p256dhPublicKey = exportedKeys[0];
-          record.p256dhPrivateKey = exportedKeys[1];
+          if (!record.p256dhPublicKey || !record.p256dhPrivateKey) {
+            record.p256dhPublicKey = pubKey;
+            record.p256dhPrivateKey = privKey;
+          }
+          if (!record.authenticationSecret) {
+            record.authenticationSecret = PushCrypto.generateAuthenticationSecret();
+          }
           return record;
         });
       }, error => {
@@ -872,9 +885,11 @@ this.PushService = {
         decodedPromise = PushCrypto.decodeMsg(
           message,
           record.p256dhPrivateKey,
+          record.p256dhPublicKey,
           cryptoParams.dh,
           cryptoParams.salt,
-          cryptoParams.rs
+          cryptoParams.rs,
+          cryptoParams.auth ? record.authenticationSecret : null
         );
       } else {
         decodedPromise = Promise.resolve(null);
@@ -883,18 +898,77 @@ this.PushService = {
         if (shouldNotify) {
           notified = this._notifyApp(record, message);
         }
-        if (record.isExpired()) {
-          this._recordDidNotNotify(kDROP_NOTIFICATION_REASON_EXPIRED);
-          // Drop the registration in the background. If the user returns to the
-          // site, the service worker will be notified on the next `idle-daily`
-          // event.
-          this._backgroundUnregister(record);
-        }
+        // Update quota after the delay, at which point
+        // we check for visible notifications.
+        setTimeout(() => this._updateQuota(keyID),
+          prefs.get("quotaUpdateDelay"));
         return notified;
+      }, error => {
+        console.error("receivedPushMessage: Error decrypting message", error);
       });
     }).catch(error => {
       console.error("receivedPushMessage: Error notifying app", error);
     });
+  },
+
+  _updateQuota: function(keyID) {
+    console.debug("updateQuota()");
+
+    this._db.update(keyID, record => {
+      // Record may have expired from an earlier quota update.
+      if (record.isExpired()) {
+        console.debug(
+          "updateQuota: Trying to update quota for expired record", record);
+        return null;
+      }
+      // If there are visible notifications, don't apply the quota penalty
+      // for the message.
+      if (!this._visibleNotifications.has(record.uri.prePath)) {
+        record.reduceQuota();
+      }
+      return record;
+    }).then(record => {
+      if (record && record.isExpired()) {
+        this._recordDidNotNotify(kDROP_NOTIFICATION_REASON_EXPIRED);
+        // Drop the registration in the background. If the user returns to the
+        // site, the service worker will be notified on the next `idle-daily`
+        // event.
+        this._backgroundUnregister(record);
+      }
+      if (this._updateQuotaTestCallback) {
+        // Callback so that test may be notified when the quota update is complete.
+        this._updateQuotaTestCallback();
+      }
+    }).catch(error => {
+      console.debug("updateQuota: Error while trying to update quota", error);
+    });
+  },
+
+  _notificationForOriginShown(origin) {
+    console.debug("notificationForOriginShown()", origin);
+    let count;
+    if (this._visibleNotifications.has(origin)) {
+      count = this._visibleNotifications.get(origin);
+    } else {
+      count = 0;
+    }
+    this._visibleNotifications.set(origin, count + 1);
+  },
+
+  _notificationForOriginClosed(origin) {
+    console.debug("notificationForOriginClosed()", origin);
+    let count;
+    if (this._visibleNotifications.has(origin)) {
+      count = this._visibleNotifications.get(origin);
+    } else {
+      console.debug("notificationForOriginClosed: closing notification that has not been shown?");
+      return;
+    }
+    if (count > 1) {
+      this._visibleNotifications.set(origin, count - 1);
+    } else {
+      this._visibleNotifications.delete(origin);
+    }
   },
 
   _notifyApp: function(aPushRecord, message) {
@@ -1055,6 +1129,20 @@ this.PushService = {
           this._childListeners.splice(i, 1);
         }
       }
+      console.debug("receiveMessage: Clearing notifications from child");
+      this._visibleNotifications.clear();
+      return;
+    }
+
+    if (aMessage.name === "Push:NotificationForOriginShown") {
+      console.debug("receiveMessage: Notification shown from child");
+      this._notificationForOriginShown(aMessage.data);
+      return;
+    }
+
+    if (aMessage.name === "Push:NotificationForOriginClosed") {
+      console.debug("receiveMessage: Notification closed from child");
+      this._notificationForOriginClosed(aMessage.data);
       return;
     }
 

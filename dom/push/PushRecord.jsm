@@ -36,6 +36,7 @@ function PushRecord(props) {
   this.lastPush = props.lastPush || 0;
   this.p256dhPublicKey = props.p256dhPublicKey;
   this.p256dhPrivateKey = props.p256dhPrivateKey;
+  this.authenticationSecret = props.authenticationSecret;
   this.setQuota(props.quota);
   this.ctime = (typeof props.ctime === "number") ? props.ctime : 0;
 }
@@ -65,25 +66,15 @@ PushRecord.prototype = {
       this.quota = 0;
       return;
     }
-    let currentQuota;
     if (lastVisit > this.lastPush) {
       // If the user visited the site since the last time we received a
       // notification, reset the quota.
       let daysElapsed = (Date.now() - lastVisit) / 24 / 60 / 60 / 1000;
-      currentQuota = Math.min(
+      this.quota = Math.min(
         Math.round(8 * Math.pow(daysElapsed, -0.8)),
         prefs.get("maxQuotaPerSubscription")
       );
-      Services.telemetry.getHistogramById("PUSH_API_QUOTA_RESET_TO").add(currentQuota - 1);
-    } else {
-      // The user hasn't visited the site since the last notification.
-      currentQuota = this.quota;
-    }
-    this.quota = Math.max(currentQuota - 1, 0);
-    // We check for ctime > 0 to skip older records that did not have ctime.
-    if (this.isExpired() && this.ctime > 0) {
-      let duration = Date.now() - this.ctime;
-      Services.telemetry.getHistogramById("PUSH_API_QUOTA_EXPIRATION_TIME").add(duration / 1000);
+      Services.telemetry.getHistogramById("PUSH_API_QUOTA_RESET_TO").add(this.quota);
     }
   },
 
@@ -91,6 +82,15 @@ PushRecord.prototype = {
     this.updateQuota(lastVisit);
     this.pushCount++;
     this.lastPush = Date.now();
+  },
+
+  reduceQuota() {
+    this.quota = Math.max(this.quota - 1, 0);
+    // We check for ctime > 0 to skip older records that did not have ctime.
+    if (this.isExpired() && this.ctime > 0) {
+      let duration = Date.now() - this.ctime;
+      Services.telemetry.getHistogramById("PUSH_API_QUOTA_EXPIRATION_TIME").add(duration / 1000);
+    }
   },
 
   /**
@@ -210,12 +210,18 @@ PushRecord.prototype = {
     return this.quota === 0;
   },
 
+  matchesOriginAttributes(pattern) {
+    return ChromeUtils.originAttributesMatchPattern(
+      this.principal.originAttributes, pattern);
+  },
+
   toSubscription() {
     return {
       pushEndpoint: this.pushEndpoint,
       lastPush: this.lastPush,
       pushCount: this.pushCount,
       p256dhKey: this.p256dhPublicKey,
+      authenticationSecret: this.authenticationSecret,
     };
   },
 };

@@ -331,8 +331,7 @@ PositionError::NotifyCallback(const GeoPositionErrorCallback& aCallback)
     PositionErrorCallback* callback = aCallback.GetWebIDLCallback();
 
     if (callback) {
-      ErrorResult err;
-      callback->Call(*this, err);
+      callback->Call(*this);
     }
   } else {
     nsIDOMGeoPositionErrorCallback* callback = aCallback.GetXPCOMCallback();
@@ -656,11 +655,10 @@ nsGeolocationRequest::SendLocation(nsIDOMGeoPosition* aPosition)
 
   nsAutoMicroTask mt;
   if (mCallback.HasWebIDLCallback()) {
-    ErrorResult err;
     PositionCallback* callback = mCallback.GetWebIDLCallback();
 
     MOZ_ASSERT(callback);
-    callback->Call(*wrapped, err);
+    callback->Call(*wrapped);
   } else {
     nsIDOMGeoPositionCallback* callback = mCallback.GetXPCOMCallback();
 
@@ -1458,7 +1456,7 @@ Geolocation::WatchPosition(PositionCallback& aCallback,
                            const PositionOptions& aOptions,
                            ErrorResult& aRv)
 {
-  int32_t ret;
+  int32_t ret = 0;
   GeoPositionCallback successCallback(&aCallback);
   GeoPositionErrorCallback errorCallback(aErrorCallback);
 

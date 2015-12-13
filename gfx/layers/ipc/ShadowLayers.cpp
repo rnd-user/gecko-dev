@@ -470,38 +470,6 @@ ShadowLayerForwarder::InWorkerThread()
   return MessageLoop::current() && (GetMessageLoop()->id() == MessageLoop::current()->id());
 }
 
-static void RemoveTextureWorker(TextureClient* aTexture, ReentrantMonitor* aBarrier, bool* aDone)
-{
-  aTexture->ForceRemove();
-
-  ReentrantMonitorAutoEnter autoMon(*aBarrier);
-  *aDone = true;
-  aBarrier->NotifyAll();
-}
-
-void
-ShadowLayerForwarder::RemoveTexture(TextureClient* aTexture)
-{
-  MOZ_ASSERT(aTexture);
-  if (InWorkerThread()) {
-    aTexture->ForceRemove();
-    return;
-  }
-
-  ReentrantMonitor barrier("ShadowLayerForwarder::RemoveTexture Lock");
-  ReentrantMonitorAutoEnter autoMon(barrier);
-  bool done = false;
-
-  GetMessageLoop()->PostTask(
-    FROM_HERE,
-    NewRunnableFunction(&RemoveTextureWorker, aTexture, &barrier, &done));
-
-  // Wait until the TextureClient has been ForceRemoved on the worker thread
-  while (!done) {
-    barrier.Wait();
-  }
-}
-
 void
 ShadowLayerForwarder::StorePluginWidgetConfigurations(const nsTArray<nsIWidget::Configuration>&
                                                       aConfigurations)
@@ -589,6 +557,7 @@ ShadowLayerForwarder::EndTransaction(InfallibleTArray<EditReply>* aReplies,
     common.postXScale() = mutant->GetPostXScale();
     common.postYScale() = mutant->GetPostYScale();
     common.transform() = mutant->GetBaseTransform();
+    common.transformIsPerspective() = mutant->GetTransformIsPerspective();
     common.contentFlags() = mutant->GetContentFlags();
     common.opacity() = mutant->GetOpacity();
     common.useClipRect() = !!mutant->GetClipRect();
@@ -598,6 +567,7 @@ ShadowLayerForwarder::EndTransaction(InfallibleTArray<EditReply>* aReplies,
     if (mutant->GetIsFixedPosition()) {
       common.fixedPositionScrollContainerId() = mutant->GetFixedPositionScrollContainerId();
       common.fixedPositionAnchor() = mutant->GetFixedPositionAnchor();
+      common.fixedPositionSides() = mutant->GetFixedPositionSides();
       common.isClipFixed() = mutant->IsClipFixed();
     }
     common.isStickyPosition() = mutant->GetIsStickyPosition();

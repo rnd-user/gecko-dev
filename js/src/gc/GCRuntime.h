@@ -537,7 +537,7 @@ struct Callback {
 };
 
 template<typename F>
-class CallbackVector : public Vector<Callback<F>, 4, SystemAllocPolicy> {};
+using CallbackVector = Vector<Callback<F>, 4, SystemAllocPolicy>;
 
 template <typename T, typename Iter0, typename Iter1>
 class ChainedIter
@@ -920,6 +920,7 @@ class GCRuntime
     bool shouldPreserveJITCode(JSCompartment* comp, int64_t currentTime,
                                JS::gcreason::Reason reason);
     void bufferGrayRoots();
+    void markCompartments();
     IncrementalProgress drainMarkStack(SliceBudget& sliceBudget, gcstats::Phase phase);
     template <class CompartmentIterT> void markWeakReferences(gcstats::Phase phase);
     void markWeakReferencesInCurrentGroup(gcstats::Phase phase);

@@ -267,15 +267,7 @@ public:
     , mValue(aValue) {}
   nsresult Get(nsIPrincipal* aSubject, nsIVariant** aResult);
   void Get(JSContext* aCx, JS::Handle<JSObject*> aScope, nsIPrincipal* aSubject,
-           JS::MutableHandle<JS::Value> aResult, mozilla::ErrorResult& aError)
-  {
-    if (aSubject->Subsumes(mOrigin)) {
-      aError = nsContentUtils::XPConnect()->VariantToJS(aCx, aScope,
-                                                        mValue, aResult);
-    } else {
-      aResult.setUndefined();
-    }
-  }
+           JS::MutableHandle<JS::Value> aResult, mozilla::ErrorResult& aError);
 private:
   virtual ~DialogValueHolder() {}
 
@@ -1131,7 +1123,10 @@ public:
   {
     MOZ_ASSERT(IsOuterWindow());
     mozilla::ErrorResult ignored;
-    return GetContentInternal(ignored, /* aUnprivilegedCaller = */ false);
+    nsCOMPtr<nsIDOMWindow> win =
+      GetContentInternal(ignored, /* aUnprivilegedCaller = */ false);
+    ignored.SuppressException();
+    return win.forget();
   }
 
   void Get_content(JSContext* aCx,

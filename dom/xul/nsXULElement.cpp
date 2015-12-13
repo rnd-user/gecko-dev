@@ -53,7 +53,6 @@
 #include "nsIScriptSecurityManager.h"
 #include "nsIServiceManager.h"
 #include "mozilla/css/StyleRule.h"
-#include "nsIStyleSheet.h"
 #include "nsIURL.h"
 #include "nsViewManager.h"
 #include "nsIWidget.h"
@@ -1618,6 +1617,17 @@ nsXULElement::GetFrameLoader()
 }
 
 nsresult
+nsXULElement::GetParentApplication(mozIApplication** aApplication)
+{
+    if (!aApplication) {
+        return NS_ERROR_FAILURE;
+    }
+
+    *aApplication = nullptr;
+    return NS_OK;
+}
+
+nsresult
 nsXULElement::SetIsPrerendered()
 {
   return SetAttr(kNameSpaceID_None, nsGkAtoms::prerendered, nullptr,
@@ -2007,7 +2017,7 @@ public:
     explicit MarginSetter(nsIWidget* aWidget) :
         mWidget(aWidget), mMargin(-1, -1, -1, -1)
     {}
-    MarginSetter(nsIWidget *aWidget, const nsIntMargin& aMargin) :
+    MarginSetter(nsIWidget *aWidget, const LayoutDeviceIntMargin& aMargin) :
         mWidget(aWidget), mMargin(aMargin)
     {}
 
@@ -2021,7 +2031,7 @@ public:
 
 private:
     nsCOMPtr<nsIWidget> mWidget;
-    nsIntMargin mMargin;
+    LayoutDeviceIntMargin mMargin;
 };
 
 void
@@ -2046,7 +2056,9 @@ nsXULElement::SetChromeMargins(const nsAttrValue* aValue)
         gotMargins = nsContentUtils::ParseIntMarginValue(tmp, margins);
     }
     if (gotMargins) {
-        nsContentUtils::AddScriptRunner(new MarginSetter(mainWidget, margins));
+        nsContentUtils::AddScriptRunner(
+            new MarginSetter(
+                mainWidget, LayoutDeviceIntMargin::FromUnknownMargin(margins)));
     }
 }
 

@@ -43,7 +43,7 @@ namespace mozilla {
 #undef LOG
 #undef LOGD
 
-extern PRLogModuleInfo* GetGMPLog();
+extern LogModule* GetGMPLog();
 #define LOG(level, x, ...) MOZ_LOG(GetGMPLog(), (level), (x, ##__VA_ARGS__))
 #define LOGD(x, ...) LOG(mozilla::LogLevel::Debug, "GMPParent[%p|childPid=%d] " x, this, mChildPid, ##__VA_ARGS__)
 
@@ -868,6 +868,12 @@ GMPParent::ReadGMPMetaData()
       }
     }
 
+    // We support the current GMPDecryptor version, and the previous.
+    // We Adapt the previous to the current in the GMPContentChild.
+    if (cap->mAPIName.EqualsLiteral(GMP_API_DECRYPTOR_BACKWARDS_COMPAT)) {
+      cap->mAPIName.AssignLiteral(GMP_API_DECRYPTOR);
+    }
+
     if (cap->mAPIName.EqualsLiteral(GMP_API_DECRYPTOR)) {
       mCanDecrypt = true;
 
@@ -1066,6 +1072,12 @@ GMPParent::Bridge(GMPServiceParent* aGMPServiceParent)
   }
   ++mGMPContentChildCount;
   return true;
+}
+
+nsString
+GMPParent::GetPluginBaseName() const
+{
+  return NS_LITERAL_STRING("gmp-") + mName;
 }
 
 } // namespace gmp

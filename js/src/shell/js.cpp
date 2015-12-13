@@ -1821,6 +1821,25 @@ static JSScript*
 ValueToScript(JSContext* cx, Value vArg, JSFunction** funp = nullptr)
 {
     RootedValue v(cx, vArg);
+
+    if (v.isString()) {
+        // To convert a string to a script, compile it. Parse it as an ES6 Program.
+        RootedLinearString linearStr(cx, StringToLinearString(cx, v.toString()));
+        if (!linearStr)
+            return nullptr;
+        size_t len = GetLinearStringLength(linearStr);
+        AutoStableStringChars linearChars(cx);
+        if (!linearChars.initTwoByte(cx, linearStr))
+            return nullptr;
+        const char16_t* chars = linearChars.twoByteRange().start().get();
+
+        RootedScript script(cx);
+        CompileOptions options(cx);
+        if (!JS::Compile(cx, options, chars, len, &script))
+            return nullptr;
+        return script;
+    }
+
     RootedFunction fun(cx, JS_ValueToFunction(cx, v));
     if (!fun)
         return nullptr;
@@ -2138,8 +2157,8 @@ BlockNotes(JSContext* cx, HandleScript script, Sprinter* sp)
 }
 
 static bool
-DisassembleScript(JSContext* cx, HandleScript script, HandleFunction fun, bool lines,
-                  bool recursive, Sprinter* sp)
+DisassembleScript(JSContext* cx, HandleScript script, HandleFunction fun,
+                  bool lines, bool recursive, bool sourceNotes, Sprinter* sp)
 {
     if (fun) {
         Sprint(sp, "flags:");
@@ -2162,7 +2181,8 @@ DisassembleScript(JSContext* cx, HandleScript script, HandleFunction fun, bool l
 
     if (!Disassemble(cx, script, lines, sp))
         return false;
-    SrcNotes(cx, script, sp);
+    if (sourceNotes)
+        SrcNotes(cx, script, sp);
     TryNotes(cx, script, sp);
     BlockNotes(cx, script, sp);
 
@@ -2175,8 +2195,10 @@ DisassembleScript(JSContext* cx, HandleScript script, HandleFunction fun, bool l
                 RootedFunction fun(cx, &obj->as<JSFunction>());
                 if (fun->isInterpreted()) {
                     RootedScript script(cx, fun->getOrCreateScript(cx));
-                    if (!script || !DisassembleScript(cx, script, fun, lines, recursive, sp))
-                        return false;
+                    if (script) {
+                        if (!DisassembleScript(cx, script, fun, lines, recursive, sourceNotes, sp))
+                            return false;
+                    }
                 } else {
                     Sprint(sp, "[native code]\n");
                 }
@@ -2189,13 +2211,14 @@ DisassembleScript(JSContext* cx, HandleScript script, HandleFunction fun, bool l
 namespace {
 
 struct DisassembleOptionParser {
-    unsigned   argc;
-    Value*  argv;
-    bool    lines;
-    bool    recursive;
+    unsigned argc;
+    Value* argv;
+    bool lines;
+    bool recursive;
+    bool sourceNotes;
 
     DisassembleOptionParser(unsigned argc, Value* argv)
-      : argc(argc), argv(argv), lines(false), recursive(false) {}
+      : argc(argc), argv(argv), lines(false), recursive(false), sourceNotes(true) {}
 
     bool parse(JSContext* cx) {
         /* Read options off early arguments */
@@ -2208,6 +2231,8 @@ struct DisassembleOptionParser {
                 lines = true;
             else if (JS_FlatStringEqualsAscii(flatStr, "-r"))
                 recursive = true;
+            else if (JS_FlatStringEqualsAscii(flatStr, "-S"))
+                sourceNotes = false;
             else
                 break;
             argv++, argc--;
@@ -2248,7 +2273,7 @@ DisassembleToSprinter(JSContext* cx, unsigned argc, Value* vp, Sprinter* sprinte
                 script = ValueToScript(cx, value, fun.address());
             if (!script)
                 return false;
-            if (!DisassembleScript(cx, script, fun, p.lines, p.recursive, sprinter))
+            if (!DisassembleScript(cx, script, fun, p.lines, p.recursive, p.sourceNotes, sprinter))
                 return false;
         }
     }
@@ -2327,7 +2352,7 @@ DisassFile(JSContext* cx, unsigned argc, Value* vp)
     Sprinter sprinter(cx);
     if (!sprinter.init())
         return false;
-    bool ok = DisassembleScript(cx, script, nullptr, p.lines, p.recursive, &sprinter);
+    bool ok = DisassembleScript(cx, script, nullptr, p.lines, p.recursive, p.sourceNotes, &sprinter);
     if (ok)
         fprintf(stdout, "%s\n", sprinter.string());
     if (!ok)
@@ -3290,8 +3315,8 @@ ParseModule(JSContext* cx, unsigned argc, Value* vp)
     CompileOptions options(cx);
     if (args.length() > 1) {
         if (!args[1].isString()) {
-            JS_ReportError(cx, "expected filename string, got %s",
-                           JS_TypeOfValue(cx, args[1]));
+            const char* typeName = InformalValueTypeName(args[1]);
+            JS_ReportError(cx, "expected filename string, got %s", typeName);
             return false;
         }
 
@@ -3947,6 +3972,11 @@ NewGlobal(JSContext* cx, unsigned argc, Value* vp)
             return false;
         if (v.isBoolean())
             options.setCloneSingletons(v.toBoolean());
+
+        if (!JS_GetProperty(cx, opts, "disableLazyParsing", &v))
+            return false;
+        if (v.isBoolean())
+            options.setDisableLazyParsing(v.toBoolean());
 
         if (!JS_GetProperty(cx, opts, "principal", &v))
             return false;
@@ -4838,22 +4868,23 @@ static const JSFunctionSpecWithHelp shell_functions[] = {
 
 #ifdef DEBUG
     JS_FN_HELP("disassemble", DisassembleToString, 1, 0,
-"disassemble([fun])",
-"  Return the disassembly for the given function."),
+"disassemble([fun/code])",
+"  Return the disassembly for the given function or code.\n"
+"  All disassembly functions take these options as leading string arguments:\n"
+"    \"-r\" (disassemble recursively)\n"
+"    \"-l\" (show line numbers)\n"
+"    \"-S\" (omit source notes)"),
 
     JS_FN_HELP("dis", Disassemble, 1, 0,
-"dis([fun])",
+"dis([fun/code])",
 "  Disassemble functions into bytecodes."),
 
     JS_FN_HELP("disfile", DisassFile, 1, 0,
 "disfile('foo.js')",
-"  Disassemble script file into bytecodes.\n"
-"  dis and disfile take these options as preceeding string arguments:\n"
-"    \"-r\" (disassemble recursively)\n"
-"    \"-l\" (show line numbers)"),
+"  Disassemble script file into bytecodes.\n"),
 
     JS_FN_HELP("dissrc", DisassWithSrc, 1, 0,
-"dissrc([fun])",
+"dissrc([fun/code])",
 "  Disassemble functions with source lines."),
 
     JS_FN_HELP("notes", Notes, 1, 0,
@@ -6047,6 +6078,9 @@ NewGlobalObject(JSContext* cx, JS::CompartmentOptions& options,
 
         /* Initialize FakeDOMObject.prototype */
         InitDOMObject(domProto);
+
+        if (!js::InitModuleClasses(cx, glob))
+            return nullptr;
     }
 
     JS_FireOnNewGlobalObject(cx, glob);
@@ -6194,29 +6228,29 @@ SetRuntimeOptions(JSRuntime* rt, const OptionParser& op)
                              .setUnboxedArrays(enableUnboxedArrays);
 
     if (op.getBoolOption("no-unboxed-objects"))
-        jit::js_JitOptions.disableUnboxedObjects = true;
+        jit::JitOptions.disableUnboxedObjects = true;
 
     if (const char* str = op.getStringOption("ion-scalar-replacement")) {
         if (strcmp(str, "on") == 0)
-            jit::js_JitOptions.disableScalarReplacement = false;
+            jit::JitOptions.disableScalarReplacement = false;
         else if (strcmp(str, "off") == 0)
-            jit::js_JitOptions.disableScalarReplacement = true;
+            jit::JitOptions.disableScalarReplacement = true;
         else
             return OptionFailure("ion-scalar-replacement", str);
     }
 
     if (const char* str = op.getStringOption("ion-shared-stubs")) {
         if (strcmp(str, "on") == 0)
-            jit::js_JitOptions.disableSharedStubs = false;
+            jit::JitOptions.disableSharedStubs = false;
         else if (strcmp(str, "off") == 0)
-            jit::js_JitOptions.disableSharedStubs = true;
+            jit::JitOptions.disableSharedStubs = true;
         else
             return OptionFailure("ion-shared-stubs", str);
     }
 
     if (const char* str = op.getStringOption("ion-gvn")) {
         if (strcmp(str, "off") == 0) {
-            jit::js_JitOptions.disableGvn = true;
+            jit::JitOptions.disableGvn = true;
         } else if (strcmp(str, "on") != 0 &&
                    strcmp(str, "optimistic") != 0 &&
                    strcmp(str, "pessimistic") != 0)
@@ -6229,128 +6263,128 @@ SetRuntimeOptions(JSRuntime* rt, const OptionParser& op)
 
     if (const char* str = op.getStringOption("ion-licm")) {
         if (strcmp(str, "on") == 0)
-            jit::js_JitOptions.disableLicm = false;
+            jit::JitOptions.disableLicm = false;
         else if (strcmp(str, "off") == 0)
-            jit::js_JitOptions.disableLicm = true;
+            jit::JitOptions.disableLicm = true;
         else
             return OptionFailure("ion-licm", str);
     }
 
     if (const char* str = op.getStringOption("ion-edgecase-analysis")) {
         if (strcmp(str, "on") == 0)
-            jit::js_JitOptions.disableEdgeCaseAnalysis = false;
+            jit::JitOptions.disableEdgeCaseAnalysis = false;
         else if (strcmp(str, "off") == 0)
-            jit::js_JitOptions.disableEdgeCaseAnalysis = true;
+            jit::JitOptions.disableEdgeCaseAnalysis = true;
         else
             return OptionFailure("ion-edgecase-analysis", str);
     }
 
     if (const char* str = op.getStringOption("ion-pgo")) {
         if (strcmp(str, "on") == 0)
-            jit::js_JitOptions.disablePgo = false;
+            jit::JitOptions.disablePgo = false;
         else if (strcmp(str, "off") == 0)
-            jit::js_JitOptions.disablePgo = true;
+            jit::JitOptions.disablePgo = true;
         else
             return OptionFailure("ion-pgo", str);
     }
 
     if (const char* str = op.getStringOption("ion-range-analysis")) {
         if (strcmp(str, "on") == 0)
-            jit::js_JitOptions.disableRangeAnalysis = false;
+            jit::JitOptions.disableRangeAnalysis = false;
         else if (strcmp(str, "off") == 0)
-            jit::js_JitOptions.disableRangeAnalysis = true;
+            jit::JitOptions.disableRangeAnalysis = true;
         else
             return OptionFailure("ion-range-analysis", str);
     }
 
     if (const char *str = op.getStringOption("ion-sincos")) {
         if (strcmp(str, "on") == 0)
-            jit::js_JitOptions.disableSincos = false;
+            jit::JitOptions.disableSincos = false;
         else if (strcmp(str, "off") == 0)
-            jit::js_JitOptions.disableSincos = true;
+            jit::JitOptions.disableSincos = true;
         else
             return OptionFailure("ion-sincos", str);
     }
 
     if (const char* str = op.getStringOption("ion-sink")) {
         if (strcmp(str, "on") == 0)
-            jit::js_JitOptions.disableSink = false;
+            jit::JitOptions.disableSink = false;
         else if (strcmp(str, "off") == 0)
-            jit::js_JitOptions.disableSink = true;
+            jit::JitOptions.disableSink = true;
         else
             return OptionFailure("ion-sink", str);
     }
 
     if (const char* str = op.getStringOption("ion-loop-unrolling")) {
         if (strcmp(str, "on") == 0)
-            jit::js_JitOptions.disableLoopUnrolling = false;
+            jit::JitOptions.disableLoopUnrolling = false;
         else if (strcmp(str, "off") == 0)
-            jit::js_JitOptions.disableLoopUnrolling = true;
+            jit::JitOptions.disableLoopUnrolling = true;
         else
             return OptionFailure("ion-loop-unrolling", str);
     }
 
     if (const char* str = op.getStringOption("ion-instruction-reordering")) {
         if (strcmp(str, "on") == 0)
-            jit::js_JitOptions.disableInstructionReordering = false;
+            jit::JitOptions.disableInstructionReordering = false;
         else if (strcmp(str, "off") == 0)
-            jit::js_JitOptions.disableInstructionReordering = true;
+            jit::JitOptions.disableInstructionReordering = true;
         else
             return OptionFailure("ion-instruction-reordering", str);
     }
 
     if (op.getBoolOption("ion-check-range-analysis"))
-        jit::js_JitOptions.checkRangeAnalysis = true;
+        jit::JitOptions.checkRangeAnalysis = true;
 
     if (op.getBoolOption("ion-extra-checks"))
-        jit::js_JitOptions.runExtraChecks = true;
+        jit::JitOptions.runExtraChecks = true;
 
     if (const char* str = op.getStringOption("ion-inlining")) {
         if (strcmp(str, "on") == 0)
-            jit::js_JitOptions.disableInlining = false;
+            jit::JitOptions.disableInlining = false;
         else if (strcmp(str, "off") == 0)
-            jit::js_JitOptions.disableInlining = true;
+            jit::JitOptions.disableInlining = true;
         else
             return OptionFailure("ion-inlining", str);
     }
 
     if (const char* str = op.getStringOption("ion-osr")) {
         if (strcmp(str, "on") == 0)
-            jit::js_JitOptions.osr = true;
+            jit::JitOptions.osr = true;
         else if (strcmp(str, "off") == 0)
-            jit::js_JitOptions.osr = false;
+            jit::JitOptions.osr = false;
         else
             return OptionFailure("ion-osr", str);
     }
 
     if (const char* str = op.getStringOption("ion-limit-script-size")) {
         if (strcmp(str, "on") == 0)
-            jit::js_JitOptions.limitScriptSize = true;
+            jit::JitOptions.limitScriptSize = true;
         else if (strcmp(str, "off") == 0)
-            jit::js_JitOptions.limitScriptSize = false;
+            jit::JitOptions.limitScriptSize = false;
         else
             return OptionFailure("ion-limit-script-size", str);
     }
 
     int32_t warmUpThreshold = op.getIntOption("ion-warmup-threshold");
     if (warmUpThreshold >= 0)
-        jit::js_JitOptions.setCompilerWarmUpThreshold(warmUpThreshold);
+        jit::JitOptions.setCompilerWarmUpThreshold(warmUpThreshold);
 
     warmUpThreshold = op.getIntOption("baseline-warmup-threshold");
     if (warmUpThreshold >= 0)
-        jit::js_JitOptions.baselineWarmUpThreshold = warmUpThreshold;
+        jit::JitOptions.baselineWarmUpThreshold = warmUpThreshold;
 
     if (op.getBoolOption("baseline-eager"))
-        jit::js_JitOptions.baselineWarmUpThreshold = 0;
+        jit::JitOptions.baselineWarmUpThreshold = 0;
 
     if (const char* str = op.getStringOption("ion-regalloc")) {
-        jit::js_JitOptions.forcedRegisterAllocator = jit::LookupRegisterAllocator(str);
-        if (!jit::js_JitOptions.forcedRegisterAllocator.isSome())
+        jit::JitOptions.forcedRegisterAllocator = jit::LookupRegisterAllocator(str);
+        if (!jit::JitOptions.forcedRegisterAllocator.isSome())
             return OptionFailure("ion-regalloc", str);
     }
 
     if (op.getBoolOption("ion-eager"))
-        jit::js_JitOptions.setEagerCompilation();
+        jit::JitOptions.setEagerCompilation();
 
     offthreadCompilation = true;
     if (const char* str = op.getStringOption("ion-offthread-compile")) {

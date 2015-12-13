@@ -43,6 +43,7 @@ public:
     void GetOutput(nsACString* out) const;
     bool CanLinkTo(const ShaderValidator* prev, nsCString* const out_log) const;
     size_t CalcNumSamplerUniforms() const;
+    size_t NumAttributes() const;
 
     bool FindAttribUserNameByMappedName(const std::string& mappedName,
                                         const std::string** const out_userName) const;
@@ -53,6 +54,9 @@ public:
     bool FindVaryingMappedNameByUserName(const std::string& userName,
                                          const std::string** const out_mappedName) const;
 
+    bool FindVaryingByMappedName(const std::string& mappedName,
+                                 std::string* const out_userName,
+                                 bool* const out_isArray) const;
     bool FindUniformByMappedName(const std::string& mappedName,
                                  std::string* const out_userName,
                                  bool* const out_isArray) const;

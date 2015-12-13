@@ -134,11 +134,16 @@ var gSyncPane = {
 
     XPCOMUtils.defineLazyGetter(this, '_stringBundle', () => {
       return Services.strings.createBundle("chrome://browser/locale/preferences/preferences.properties");
-    }),
+    });
 
     XPCOMUtils.defineLazyGetter(this, '_accountsStringBundle', () => {
       return Services.strings.createBundle("chrome://browser/locale/accounts.properties");
-    }),
+    });
+
+    let url = Services.prefs.getCharPref("identity.mobilepromo.android") + "sync-preferences";
+    document.getElementById("fxaMobilePromo-android").setAttribute("href", url);
+    url = Services.prefs.getCharPref("identity.mobilepromo.ios") + "sync-preferences";
+    document.getElementById("fxaMobilePromo-ios").setAttribute("href", url);
 
     this.updateWeavePrefs();
 
@@ -185,10 +190,6 @@ var gSyncPane = {
     document.getElementById("syncStatusMessage").removeAttribute("message-type");
     document.getElementById("syncStatusMessageTitle").textContent = "";
     document.getElementById("syncStatusMessageDescription").textContent = "";
-    let learnMoreLink = document.getElementById("learnMoreLink");
-    if (learnMoreLink) {
-      learnMoreLink.parentNode.removeChild(learnMoreLink);
-    }
   },
 
   _setupEventListeners: function() {

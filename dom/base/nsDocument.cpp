@@ -240,6 +240,7 @@
 #include "mozilla/dom/BoxObject.h"
 #include "gfxVR.h"
 #include "gfxPrefs.h"
+#include "nsISupportsPrimitives.h"
 
 #include "mozilla/DocLoadingTimelineMarker.h"
 
@@ -257,8 +258,8 @@ using namespace mozilla::dom;
 
 typedef nsTArray<Link*> LinkArray;
 
-static PRLogModuleInfo* gDocumentLeakPRLog;
-static PRLogModuleInfo* gCspPRLog;
+static LazyLogModule gDocumentLeakPRLog("DocumentLeak");
+static LazyLogModule gCspPRLog("CSP");
 
 #define NAME_NOT_VALID ((nsSimpleContentList*)1)
 
@@ -314,8 +315,6 @@ nsIdentifierMapEntry::AddContentChangeCallback(nsIDocument::IDTargetObserver aCa
 {
   if (!mChangeCallbacks) {
     mChangeCallbacks = new nsTHashtable<ChangeCallbackEntry>;
-    if (!mChangeCallbacks)
-      return;
   }
 
   ChangeCallback cc = { aCallback, aData, aForImage };
@@ -376,19 +375,11 @@ NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(Registry)
       cb.NoteXPCOMChild(callbacks->mDetachedCallback.Value());
     }
   }
-  for (auto iter = tmp->mCandidatesMap.Iter(); !iter.Done(); iter.Next()) {
-    nsTArray<RefPtr<Element>>* elems = iter.UserData();
-    for (size_t i = 0; i < elems->Length(); ++i) {
-      NS_CYCLE_COLLECTION_NOTE_EDGE_NAME(cb, "mCandidatesMap->Element");
-      cb.NoteXPCOMChild(elems->ElementAt(i));
-    }
-  }
   NS_IMPL_CYCLE_COLLECTION_TRAVERSE_SCRIPT_OBJECTS
 NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
 
 NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN(Registry)
   tmp->mCustomDefinitions.Clear();
-  tmp->mCandidatesMap.Clear();
 NS_IMPL_CYCLE_COLLECTION_UNLINK_END
 
 NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(Registry)
@@ -725,15 +716,6 @@ nsDOMStyleSheetList::Length()
   // been added or removed.
   if (-1 == mLength) {
     mLength = mDocument->GetNumberOfStyleSheets();
-
-#ifdef DEBUG
-    int32_t i;
-    for (i = 0; i < mLength; i++) {
-      nsIStyleSheet *sheet = mDocument->GetStyleSheetAt(i);
-      nsCOMPtr<nsIDOMStyleSheet> domss(do_QueryInterface(sheet));
-      NS_ASSERTION(domss, "All \"normal\" sheets implement nsIDOMStyleSheet");
-    }
-#endif
   }
   return mLength;
 }
@@ -747,7 +729,7 @@ nsDOMStyleSheetList::IndexedGetter(uint32_t aIndex, bool& aFound)
   }
 
   aFound = true;
-  nsIStyleSheet *sheet = mDocument->GetStyleSheetAt(aIndex);
+  CSSStyleSheet* sheet = mDocument->GetStyleSheetAt(aIndex);
   NS_ASSERTION(sheet, "Must have a sheet");
 
   return static_cast<CSSStyleSheet*>(sheet);
@@ -761,27 +743,21 @@ nsDOMStyleSheetList::NodeWillBeDestroyed(const nsINode *aNode)
 
 void
 nsDOMStyleSheetList::StyleSheetAdded(nsIDocument *aDocument,
-                                     nsIStyleSheet* aStyleSheet,
+                                     CSSStyleSheet* aStyleSheet,
                                      bool aDocumentSheet)
 {
   if (aDocumentSheet && -1 != mLength) {
-    nsCOMPtr<nsIDOMStyleSheet> domss(do_QueryInterface(aStyleSheet));
-    if (domss) {
-      mLength++;
-    }
+    mLength++;
   }
 }
 
 void
 nsDOMStyleSheetList::StyleSheetRemoved(nsIDocument *aDocument,
-                                       nsIStyleSheet* aStyleSheet,
+                                       CSSStyleSheet* aStyleSheet,
                                        bool aDocumentSheet)
 {
   if (aDocumentSheet && -1 != mLength) {
-    nsCOMPtr<nsIDOMStyleSheet> domss(do_QueryInterface(aStyleSheet));
-    if (domss) {
-      mLength--;
-    }
+    mLength--;
   }
 }
 
@@ -1262,9 +1238,6 @@ IMPL_SHIM(nsIApplicationCacheContainer)
         return NS_NOINTERFACE;                                             \
       }                                                                    \
       nsCOMPtr<_i> shim = new _i##Shim(this, real);                        \
-      if (!shim) {                                                         \
-        return NS_ERROR_OUT_OF_MEMORY;                                     \
-      }                                                                    \
       shim.forget(aSink);                                                  \
       return NS_OK;                                                        \
     }                                                                      \
@@ -1347,7 +1320,7 @@ nsDOMStyleSheetSetList::EnsureFresh()
   int32_t count = mDocument->GetNumberOfStyleSheets();
   nsAutoString title;
   for (int32_t index = 0; index < count; index++) {
-    nsIStyleSheet* sheet = mDocument->GetStyleSheetAt(index);
+    CSSStyleSheet* sheet = mDocument->GetStyleSheetAt(index);
     NS_ASSERTION(sheet, "Null sheet in sheet list!");
     sheet->GetTitle(title);
     if (!title.IsEmpty() && !mNames.Contains(title) && !Add(title)) {
@@ -1441,6 +1414,7 @@ nsIDocument::nsIDocument()
     mReferrerPolicySet(false),
     mReferrerPolicy(mozilla::net::RP_Default),
     mUpgradeInsecureRequests(false),
+    mUpgradeInsecurePreloads(false),
     mCharacterSet(NS_LITERAL_CSTRING("ISO-8859-1")),
     mNodeInfoManager(nullptr),
     mCompatMode(eCompatibility_FullStandards),
@@ -1478,15 +1452,9 @@ nsDocument::nsDocument(const char* aContentType)
 {
   SetContentTypeInternal(nsDependentCString(aContentType));
 
-  if (!gDocumentLeakPRLog)
-    gDocumentLeakPRLog = PR_NewLogModule("DocumentLeak");
-
   if (gDocumentLeakPRLog)
     MOZ_LOG(gDocumentLeakPRLog, LogLevel::Debug,
            ("DOCUMENT %p created", this));
-
-  if (!gCspPRLog)
-    gCspPRLog = PR_NewLogModule("CSP");
 
   // Start out mLastStyleSheetSet as null, per spec
   SetDOMStringToNull(mLastStyleSheetSet);
@@ -1623,9 +1591,7 @@ nsDocument::~nsDocument()
 
   nsAutoScriptBlocker scriptBlocker;
 
-  int32_t indx; // must be signed
-  uint32_t count = mChildren.ChildCount();
-  for (indx = int32_t(count) - 1; indx >= 0; --indx) {
+  for (uint32_t indx = mChildren.ChildCount(); indx-- != 0; ) {
     mChildren.ChildAt(indx)->UnbindFromTree();
     mChildren.RemoveChildAt(indx);
   }
@@ -1633,9 +1599,8 @@ nsDocument::~nsDocument()
   mCachedRootElement = nullptr;
 
   // Let the stylesheets know we're going away
-  indx = mStyleSheets.Count();
-  while (--indx >= 0) {
-    mStyleSheets[indx]->SetOwningDocument(nullptr);
+  for (CSSStyleSheet* sheet : mStyleSheets) {
+    sheet->SetOwningDocument(nullptr);
   }
   if (mAttrStyleSheet) {
     mAttrStyleSheet->SetOwningDocument(nullptr);
@@ -1672,6 +1637,11 @@ nsDocument::~nsDocument()
   mImageTracker.Clear();
 
   mPlugins.Clear();
+
+  nsCOMPtr<nsIObserverService> os = mozilla::services::GetObserverService();
+  if (os) {
+    os->RemoveObserver(this, "service-worker-get-client");
+  }
 }
 
 NS_INTERFACE_TABLE_HEAD(nsDocument)
@@ -2073,6 +2043,11 @@ nsDocument::Init()
 
   mozilla::HoldJSObjects(this);
 
+  nsCOMPtr<nsIObserverService> os = mozilla::services::GetObserverService();
+  if (os) {
+    os->AddObserver(this, "service-worker-get-client", /* ownsWeak */ true);
+  }
+
   return NS_OK;
 }
 
@@ -2295,9 +2270,7 @@ void
 nsDocument::RemoveDocStyleSheetsFromStyleSets()
 {
   // The stylesheets should forget us
-  int32_t indx = mStyleSheets.Count();
-  while (--indx >= 0) {
-    nsIStyleSheet* sheet = mStyleSheets[indx];
+  for (CSSStyleSheet* sheet : Reversed(mStyleSheets)) {
     sheet->SetOwningDocument(nullptr);
 
     if (sheet->IsApplicable()) {
@@ -2311,12 +2284,12 @@ nsDocument::RemoveDocStyleSheetsFromStyleSets()
 }
 
 void
-nsDocument::RemoveStyleSheetsFromStyleSets(nsCOMArray<nsIStyleSheet>& aSheets, SheetType aType)
+nsDocument::RemoveStyleSheetsFromStyleSets(
+    nsTArray<RefPtr<CSSStyleSheet>>& aSheets,
+    SheetType aType)
 {
   // The stylesheets should forget us
-  int32_t indx = aSheets.Count();
-  while (--indx >= 0) {
-    nsIStyleSheet* sheet = aSheets[indx];
+  for (CSSStyleSheet* sheet : Reversed(aSheets)) {
     sheet->SetOwningDocument(nullptr);
 
     if (sheet->IsApplicable()) {
@@ -2325,10 +2298,8 @@ nsDocument::RemoveStyleSheetsFromStyleSets(nsCOMArray<nsIStyleSheet>& aSheets, S
         shell->StyleSet()->RemoveStyleSheet(aType, sheet);
       }
     }
-
     // XXX Tell observers?
   }
-
 }
 
 void
@@ -2342,6 +2313,11 @@ nsDocument::ResetStylesheetsToURI(nsIURI* aURI)
   RemoveStyleSheetsFromStyleSets(mAdditionalSheets[eAgentSheet], SheetType::Agent);
   RemoveStyleSheetsFromStyleSets(mAdditionalSheets[eUserSheet], SheetType::User);
   RemoveStyleSheetsFromStyleSets(mAdditionalSheets[eAuthorSheet], SheetType::Doc);
+
+  nsStyleSheetService *sheetService = nsStyleSheetService::GetInstance();
+  if (sheetService) {
+    RemoveStyleSheetsFromStyleSets(*sheetService->AuthorStyleSheets(), SheetType::Doc);
+  }
 
   // Release all the sheets
   mStyleSheets.Clear();
@@ -2378,21 +2354,13 @@ nsDocument::ResetStylesheetsToURI(nsIURI* aURI)
   }
 }
 
-static bool
-AppendAuthorSheet(nsIStyleSheet *aSheet, void *aData)
-{
-  nsStyleSet *styleSet = static_cast<nsStyleSet*>(aData);
-  styleSet->AppendStyleSheet(SheetType::Doc, aSheet);
-  return true;
-}
-
 static void
 AppendSheetsToStyleSet(nsStyleSet* aStyleSet,
-                       const nsCOMArray<nsIStyleSheet>& aSheets,
+                       const nsTArray<RefPtr<CSSStyleSheet>>& aSheets,
                        SheetType aType)
 {
-  for (int32_t i = aSheets.Count() - 1; i >= 0; --i) {
-    aStyleSet->AppendStyleSheet(aType, aSheets[i]);
+  for (CSSStyleSheet* sheet : Reversed(aSheets)) {
+    aStyleSet->AppendStyleSheet(aType, sheet);
   }
 }
 
@@ -2404,9 +2372,7 @@ nsDocument::FillStyleSet(nsStyleSet* aStyleSet)
   NS_PRECONDITION(aStyleSet->SheetCount(SheetType::Doc) == 0,
                   "Style set already has document sheets?");
 
-  int32_t i;
-  for (i = mStyleSheets.Count() - 1; i >= 0; --i) {
-    nsIStyleSheet* sheet = mStyleSheets[i];
+  for (CSSStyleSheet* sheet : Reversed(mStyleSheets)) {
     if (sheet->IsApplicable()) {
       aStyleSet->AddDocStyleSheet(sheet, this);
     }
@@ -2414,13 +2380,13 @@ nsDocument::FillStyleSet(nsStyleSet* aStyleSet)
 
   nsStyleSheetService *sheetService = nsStyleSheetService::GetInstance();
   if (sheetService) {
-    sheetService->AuthorStyleSheets()->EnumerateForwards(AppendAuthorSheet,
-                                                         aStyleSet);
+    for (CSSStyleSheet* sheet : *sheetService->AuthorStyleSheets()) {
+      aStyleSet->AppendStyleSheet(SheetType::Doc, sheet);
+    }
   }
 
   // Iterate backwards to maintain order
-  for (i = mOnDemandBuiltInUASheets.Count() - 1; i >= 0; --i) {
-    nsIStyleSheet* sheet = mOnDemandBuiltInUASheets[i];
+  for (CSSStyleSheet* sheet : Reversed(mOnDemandBuiltInUASheets)) {
     if (sheet->IsApplicable()) {
       aStyleSet->PrependStyleSheet(SheetType::Agent, sheet);
     }
@@ -2574,6 +2540,11 @@ nsDocument::StartDocumentLoad(const char* aCommand, nsIChannel* aChannel,
     if (sameTypeParent) {
       mUpgradeInsecureRequests =
         sameTypeParent->GetDocument()->GetUpgradeInsecureRequests();
+      // if the parent document makes use of upgrade-insecure-requests
+      // then subdocument preloads should always be upgraded.
+      mUpgradeInsecurePreloads =
+        mUpgradeInsecureRequests ||
+        sameTypeParent->GetDocument()->GetUpgradeInsecurePreloads();
     }
   }
 
@@ -2615,7 +2586,7 @@ AppendCSPFromHeader(nsIContentSecurityPolicy* csp,
   nsCharSeparatedTokenizer tokenizer(aHeaderValue, ',');
   while (tokenizer.hasMoreTokens()) {
       const nsSubstring& policy = tokenizer.nextToken();
-      rv = csp->AppendPolicy(policy, aReportOnly);
+      rv = csp->AppendPolicy(policy, aReportOnly, false);
       NS_ENSURE_SUCCESS(rv, rv);
       {
         MOZ_LOG(gCspPRLog, LogLevel::Debug,
@@ -2651,6 +2622,47 @@ nsDocument::IsLoopDocument(nsIChannel *aChannel)
     }
   }
   return isLoop;
+}
+
+void
+nsDocument::ApplySettingsFromCSP(bool aSpeculative)
+{
+  nsresult rv = NS_OK;
+  if (!aSpeculative) {
+    // 1) apply settings from regular CSP
+    nsCOMPtr<nsIContentSecurityPolicy> csp;
+    rv = NodePrincipal()->GetCsp(getter_AddRefs(csp));
+    NS_ENSURE_SUCCESS_VOID(rv);
+    if (csp) {
+      // Set up any Referrer Policy specified by CSP
+      bool hasReferrerPolicy = false;
+      uint32_t referrerPolicy = mozilla::net::RP_Default;
+      rv = csp->GetReferrerPolicy(&referrerPolicy, &hasReferrerPolicy);
+      NS_ENSURE_SUCCESS_VOID(rv);
+      if (hasReferrerPolicy) {
+        mReferrerPolicy = static_cast<ReferrerPolicy>(referrerPolicy);
+        mReferrerPolicySet = true;
+      }
+
+      // Set up 'upgrade-insecure-requests' if not already inherited
+      // from the parent context or set by any other CSP.
+      if (!mUpgradeInsecureRequests) {
+        rv = csp->GetUpgradeInsecureRequests(&mUpgradeInsecureRequests);
+        NS_ENSURE_SUCCESS_VOID(rv);
+      }
+    }
+    return;
+  }
+
+  // 2) apply settings from speculative csp
+  if (!mUpgradeInsecurePreloads) {
+    nsCOMPtr<nsIContentSecurityPolicy> preloadCsp;
+    rv = NodePrincipal()->GetPreloadCsp(getter_AddRefs(preloadCsp));
+    NS_ENSURE_SUCCESS_VOID(rv);
+    if (preloadCsp) {
+      preloadCsp->GetUpgradeInsecureRequests(&mUpgradeInsecurePreloads);
+    }
+  }
 }
 
 nsresult
@@ -2768,12 +2780,12 @@ nsDocument::InitCSP(nsIChannel* aChannel)
 
   // ----- if the doc is an app and we want a default CSP, apply it.
   if (applyAppDefaultCSP) {
-    csp->AppendPolicy(appDefaultCSP, false);
+    csp->AppendPolicy(appDefaultCSP, false, false);
   }
 
   // ----- if the doc is an app and specifies a CSP in its manifest, apply it.
   if (applyAppManifestCSP) {
-    csp->AppendPolicy(appManifestCSP, false);
+    csp->AppendPolicy(appManifestCSP, false, false);
   }
 
   // ----- if the doc is part of Loop, apply the loop CSP
@@ -2783,7 +2795,7 @@ nsDocument::InitCSP(nsIChannel* aChannel)
     NS_ASSERTION(loopCSP, "Missing loop.CSP preference");
     // If the pref has been removed, we continue without setting a CSP
     if (loopCSP) {
-      csp->AppendPolicy(loopCSP, false);
+      csp->AppendPolicy(loopCSP, false, false);
     }
   }
 
@@ -2815,33 +2827,12 @@ nsDocument::InitCSP(nsIChannel* aChannel)
     }
   }
 
-  // ----- Set up any Referrer Policy specified by CSP
-  bool hasReferrerPolicy = false;
-  uint32_t referrerPolicy = mozilla::net::RP_Default;
-  rv = csp->GetReferrerPolicy(&referrerPolicy, &hasReferrerPolicy);
-  NS_ENSURE_SUCCESS(rv, rv);
-  if (hasReferrerPolicy) {
-    // Referrer policy spec (section 6.1) says that we always use the newest
-    // referrer policy we find
-    mReferrerPolicy = static_cast<ReferrerPolicy>(referrerPolicy);
-    mReferrerPolicySet = true;
-
-    // Referrer Policy is set separately for the speculative parser in
-    // nsHTMLDocument::StartDocumentLoad() so there's nothing to do here for
-    // speculative loads.
-  }
-
-  // ------ Set flag for 'upgrade-insecure-requests' if not already
-  //        inherited from the parent context.
-  if (!mUpgradeInsecureRequests) {
-    rv = csp->GetUpgradeInsecureRequests(&mUpgradeInsecureRequests);
-    NS_ENSURE_SUCCESS(rv, rv);
-  }
-
   rv = principal->SetCsp(csp);
   NS_ENSURE_SUCCESS(rv, rv);
   MOZ_LOG(gCspPRLog, LogLevel::Debug,
          ("Inserted CSP into principal %p", principal));
+
+  ApplySettingsFromCSP(false);
 
   return NS_OK;
 }
@@ -3983,8 +3974,7 @@ nsDocument::RemoveChildAt(uint32_t aIndex, bool aNotify)
 void
 nsDocument::EnsureOnDemandBuiltInUASheet(CSSStyleSheet* aSheet)
 {
-  // Contains() takes nsISupport*, so annoyingly we have to cast here
-  if (mOnDemandBuiltInUASheets.Contains(static_cast<nsIStyleSheet*>(aSheet))) {
+  if (mOnDemandBuiltInUASheets.Contains(aSheet)) {
     return;
   }
   BeginUpdate(UPDATE_STYLE);
@@ -3995,8 +3985,7 @@ nsDocument::EnsureOnDemandBuiltInUASheet(CSSStyleSheet* aSheet)
 void
 nsDocument::AddOnDemandBuiltInUASheet(CSSStyleSheet* aSheet)
 {
-  // Contains() takes nsISupport*, so annoyingly we have to cast here
-  MOZ_ASSERT(!mOnDemandBuiltInUASheets.Contains(static_cast<nsIStyleSheet*>(aSheet)));
+  MOZ_ASSERT(!mOnDemandBuiltInUASheets.Contains(aSheet));
 
   // Prepend here so that we store the sheets in mOnDemandBuiltInUASheets in
   // the same order that they should end up in the style set.
@@ -4020,24 +4009,23 @@ nsDocument::AddOnDemandBuiltInUASheet(CSSStyleSheet* aSheet)
 int32_t
 nsDocument::GetNumberOfStyleSheets() const
 {
-  return mStyleSheets.Count();
+  return mStyleSheets.Length();
 }
 
-nsIStyleSheet*
+CSSStyleSheet*
 nsDocument::GetStyleSheetAt(int32_t aIndex) const
 {
-  NS_ENSURE_TRUE(0 <= aIndex && aIndex < mStyleSheets.Count(), nullptr);
-  return mStyleSheets[aIndex];
+  return mStyleSheets.SafeElementAt(aIndex, nullptr);
 }
 
 int32_t
-nsDocument::GetIndexOfStyleSheet(nsIStyleSheet* aSheet) const
+nsDocument::GetIndexOfStyleSheet(CSSStyleSheet* aSheet) const
 {
   return mStyleSheets.IndexOf(aSheet);
 }
 
 void
-nsDocument::AddStyleSheetToStyleSets(nsIStyleSheet* aSheet)
+nsDocument::AddStyleSheetToStyleSets(CSSStyleSheet* aSheet)
 {
   nsCOMPtr<nsIPresShell> shell = GetShell();
   if (shell) {
@@ -4047,15 +4035,10 @@ nsDocument::AddStyleSheetToStyleSets(nsIStyleSheet* aSheet)
 
 #define DO_STYLESHEET_NOTIFICATION(className, type, memberName, argName)      \
   do {                                                                        \
-    RefPtr<CSSStyleSheet> cssSheet = do_QueryObject(aSheet);                \
-    if (!cssSheet) {                                                          \
-      return;                                                                 \
-    }                                                                         \
-                                                                              \
     className##Init init;                                                     \
     init.mBubbles = true;                                                     \
     init.mCancelable = true;                                                  \
-    init.mStylesheet = cssSheet;                                              \
+    init.mStylesheet = aSheet;                                                \
     init.memberName = argName;                                                \
                                                                               \
     RefPtr<className> event =                                               \
@@ -4069,7 +4052,7 @@ nsDocument::AddStyleSheetToStyleSets(nsIStyleSheet* aSheet)
   } while (0);
 
 void
-nsDocument::NotifyStyleSheetAdded(nsIStyleSheet* aSheet, bool aDocumentSheet)
+nsDocument::NotifyStyleSheetAdded(CSSStyleSheet* aSheet, bool aDocumentSheet)
 {
   NS_DOCUMENT_NOTIFY_OBSERVERS(StyleSheetAdded, (this, aSheet, aDocumentSheet));
 
@@ -4082,7 +4065,7 @@ nsDocument::NotifyStyleSheetAdded(nsIStyleSheet* aSheet, bool aDocumentSheet)
 }
 
 void
-nsDocument::NotifyStyleSheetRemoved(nsIStyleSheet* aSheet, bool aDocumentSheet)
+nsDocument::NotifyStyleSheetRemoved(CSSStyleSheet* aSheet, bool aDocumentSheet)
 {
   NS_DOCUMENT_NOTIFY_OBSERVERS(StyleSheetRemoved, (this, aSheet, aDocumentSheet));
 
@@ -4095,10 +4078,10 @@ nsDocument::NotifyStyleSheetRemoved(nsIStyleSheet* aSheet, bool aDocumentSheet)
 }
 
 void
-nsDocument::AddStyleSheet(nsIStyleSheet* aSheet)
+nsDocument::AddStyleSheet(CSSStyleSheet* aSheet)
 {
   NS_PRECONDITION(aSheet, "null arg");
-  mStyleSheets.AppendObject(aSheet);
+  mStyleSheets.AppendElement(aSheet);
   aSheet->SetOwningDocument(this);
 
   if (aSheet->IsApplicable()) {
@@ -4109,7 +4092,7 @@ nsDocument::AddStyleSheet(nsIStyleSheet* aSheet)
 }
 
 void
-nsDocument::RemoveStyleSheetFromStyleSets(nsIStyleSheet* aSheet)
+nsDocument::RemoveStyleSheetFromStyleSets(CSSStyleSheet* aSheet)
 {
   nsCOMPtr<nsIPresShell> shell = GetShell();
   if (shell) {
@@ -4118,12 +4101,12 @@ nsDocument::RemoveStyleSheetFromStyleSets(nsIStyleSheet* aSheet)
 }
 
 void
-nsDocument::RemoveStyleSheet(nsIStyleSheet* aSheet)
+nsDocument::RemoveStyleSheet(CSSStyleSheet* aSheet)
 {
   NS_PRECONDITION(aSheet, "null arg");
-  nsCOMPtr<nsIStyleSheet> sheet = aSheet; // hold ref so it won't die too soon
+  RefPtr<CSSStyleSheet> sheet = aSheet; // hold ref so it won't die too soon
 
-  if (!mStyleSheets.RemoveObject(aSheet)) {
+  if (!mStyleSheets.RemoveElement(aSheet)) {
     NS_ASSERTION(mInUnlinkOrDeletion, "stylesheet not found");
     return;
   }
@@ -4140,17 +4123,17 @@ nsDocument::RemoveStyleSheet(nsIStyleSheet* aSheet)
 }
 
 void
-nsDocument::UpdateStyleSheets(nsCOMArray<nsIStyleSheet>& aOldSheets,
-                              nsCOMArray<nsIStyleSheet>& aNewSheets)
+nsDocument::UpdateStyleSheets(nsTArray<RefPtr<CSSStyleSheet>>& aOldSheets,
+                              nsTArray<RefPtr<CSSStyleSheet>>& aNewSheets)
 {
   BeginUpdate(UPDATE_STYLE);
 
   // XXX Need to set the sheet on the ownernode, if any
-  NS_PRECONDITION(aOldSheets.Count() == aNewSheets.Count(),
+  NS_PRECONDITION(aOldSheets.Length() == aNewSheets.Length(),
                   "The lists must be the same length!");
-  int32_t count = aOldSheets.Count();
+  int32_t count = aOldSheets.Length();
 
-  nsCOMPtr<nsIStyleSheet> oldSheet;
+  RefPtr<CSSStyleSheet> oldSheet;
   int32_t i;
   for (i = 0; i < count; ++i) {
     oldSheet = aOldSheets[i];
@@ -4161,9 +4144,9 @@ nsDocument::UpdateStyleSheets(nsCOMArray<nsIStyleSheet>& aOldSheets,
     RemoveStyleSheet(oldSheet);  // This does the right notifications
 
     // Now put the new one in its place.  If it's null, just ignore it.
-    nsIStyleSheet* newSheet = aNewSheets[i];
+    CSSStyleSheet* newSheet = aNewSheets[i];
     if (newSheet) {
-      mStyleSheets.InsertObjectAt(newSheet, oldIndex);
+      mStyleSheets.InsertElementAt(oldIndex, newSheet);
       newSheet->SetOwningDocument(this);
       if (newSheet->IsApplicable()) {
         AddStyleSheetToStyleSets(newSheet);
@@ -4177,10 +4160,11 @@ nsDocument::UpdateStyleSheets(nsCOMArray<nsIStyleSheet>& aOldSheets,
 }
 
 void
-nsDocument::InsertStyleSheetAt(nsIStyleSheet* aSheet, int32_t aIndex)
+nsDocument::InsertStyleSheetAt(CSSStyleSheet* aSheet, int32_t aIndex)
 {
   NS_PRECONDITION(aSheet, "null ptr");
-  mStyleSheets.InsertObjectAt(aSheet, aIndex);
+
+  mStyleSheets.InsertElementAt(aIndex, aSheet);
 
   aSheet->SetOwningDocument(this);
 
@@ -4193,13 +4177,13 @@ nsDocument::InsertStyleSheetAt(nsIStyleSheet* aSheet, int32_t aIndex)
 
 
 void
-nsDocument::SetStyleSheetApplicableState(nsIStyleSheet* aSheet,
+nsDocument::SetStyleSheetApplicableState(CSSStyleSheet* aSheet,
                                          bool aApplicable)
 {
   NS_PRECONDITION(aSheet, "null arg");
 
   // If we're actually in the document style sheet list
-  if (-1 != mStyleSheets.IndexOf(aSheet)) {
+  if (mStyleSheets.IndexOf(aSheet) != mStyleSheets.NoIndex) {
     if (aApplicable) {
       AddStyleSheetToStyleSets(aSheet);
     } else {
@@ -4260,9 +4244,9 @@ ConvertAdditionalSheetType(nsIDocument::additionalSheetType aType)
 }
 
 static int32_t
-FindSheet(const nsCOMArray<nsIStyleSheet>& aSheets, nsIURI* aSheetURI)
+FindSheet(const nsTArray<RefPtr<CSSStyleSheet>>& aSheets, nsIURI* aSheetURI)
 {
-  for (int32_t i = aSheets.Count() - 1; i >= 0; i-- ) {
+  for (int32_t i = aSheets.Length() - 1; i >= 0; i-- ) {
     bool bEqual;
     nsIURI* uri = aSheets[i]->GetSheetURI();
 
@@ -4316,7 +4300,7 @@ nsDocument::LoadAdditionalStyleSheet(additionalSheetType aType,
 }
 
 nsresult
-nsDocument::AddAdditionalStyleSheet(additionalSheetType aType, nsIStyleSheet* aSheet)
+nsDocument::AddAdditionalStyleSheet(additionalSheetType aType, CSSStyleSheet* aSheet)
 {
   if (mAdditionalSheets[aType].Contains(aSheet))
     return NS_ERROR_INVALID_ARG;
@@ -4324,7 +4308,7 @@ nsDocument::AddAdditionalStyleSheet(additionalSheetType aType, nsIStyleSheet* aS
   if (!aSheet->IsApplicable())
     return NS_ERROR_INVALID_ARG;
 
-  mAdditionalSheets[aType].AppendObject(aSheet);
+  mAdditionalSheets[aType].AppendElement(aSheet);
 
   BeginUpdate(UPDATE_STYLE);
   nsCOMPtr<nsIPresShell> shell = GetShell();
@@ -4345,12 +4329,12 @@ nsDocument::RemoveAdditionalStyleSheet(additionalSheetType aType, nsIURI* aSheet
 {
   MOZ_ASSERT(aSheetURI);
 
-  nsCOMArray<nsIStyleSheet>& sheets = mAdditionalSheets[aType];
+  nsTArray<RefPtr<CSSStyleSheet>>& sheets = mAdditionalSheets[aType];
 
   int32_t i = FindSheet(mAdditionalSheets[aType], aSheetURI);
   if (i >= 0) {
-    nsCOMPtr<nsIStyleSheet> sheetRef = sheets[i];
-    sheets.RemoveObjectAt(i);
+    RefPtr<CSSStyleSheet> sheetRef = sheets[i];
+    sheets.RemoveElementAt(i);
 
     BeginUpdate(UPDATE_STYLE);
     if (!mIsGoingAway) {
@@ -4371,10 +4355,10 @@ nsDocument::RemoveAdditionalStyleSheet(additionalSheetType aType, nsIURI* aSheet
   }
 }
 
-nsIStyleSheet*
+CSSStyleSheet*
 nsDocument::FirstAdditionalAuthorSheet()
 {
-  return mAdditionalSheets[eAuthorSheet].SafeObjectAt(0);
+  return mAdditionalSheets[eAuthorSheet].SafeElementAt(0, nullptr);
 }
 
 nsIGlobalObject*
@@ -4638,7 +4622,10 @@ nsDocument::SetScriptGlobalObject(nsIScriptGlobalObject *aScriptGlobalObject)
 
     nsCOMPtr<nsIServiceWorkerManager> swm = mozilla::services::GetServiceWorkerManager();
     if (swm) {
-      swm->MaybeStartControlling(this);
+      nsAutoString documentId;
+      static_cast<nsDocShell*>(docShell.get())->GetInterceptedDocumentId(documentId);
+
+      swm->MaybeStartControlling(this, documentId);
       mMaybeServiceWorkerControlled = true;
     }
   }
@@ -5063,6 +5050,14 @@ nsDocument::DispatchContentLoadedEvents()
                                         true, true);
   }
 
+  if (mMaybeServiceWorkerControlled) {
+    using mozilla::dom::workers::ServiceWorkerManager;
+    RefPtr<ServiceWorkerManager> swm = ServiceWorkerManager::GetInstance();
+    if (swm) {
+      swm->MaybeCheckNavigationUpdate(this);
+    }
+  }
+
   UnblockOnload(true);
 }
 
@@ -5121,25 +5116,23 @@ nsDocument::DocumentStatesChanged(EventStates aStateMask)
 }
 
 void
-nsDocument::StyleRuleChanged(nsIStyleSheet* aSheet,
-                             css::Rule* aOldStyleRule,
-                             css::Rule* aNewStyleRule)
+nsDocument::StyleRuleChanged(CSSStyleSheet* aSheet,
+                             css::Rule* aStyleRule)
 {
   NS_DOCUMENT_NOTIFY_OBSERVERS(StyleRuleChanged,
                                (this, aSheet,
-                                aOldStyleRule, aNewStyleRule));
+                                aStyleRule));
 
   if (StyleSheetChangeEventsEnabled()) {
     DO_STYLESHEET_NOTIFICATION(StyleRuleChangeEvent,
                                "StyleRuleChanged",
                                mRule,
-                               aNewStyleRule ? aNewStyleRule->GetDOMRule()
-                                             : nullptr);
+                               aStyleRule ? aStyleRule->GetDOMRule() : nullptr);
   }
 }
 
 void
-nsDocument::StyleRuleAdded(nsIStyleSheet* aSheet,
+nsDocument::StyleRuleAdded(CSSStyleSheet* aSheet,
                            css::Rule* aStyleRule)
 {
   NS_DOCUMENT_NOTIFY_OBSERVERS(StyleRuleAdded,
@@ -5155,7 +5148,7 @@ nsDocument::StyleRuleAdded(nsIStyleSheet* aSheet,
 }
 
 void
-nsDocument::StyleRuleRemoved(nsIStyleSheet* aSheet,
+nsDocument::StyleRuleRemoved(CSSStyleSheet* aSheet,
                              css::Rule* aStyleRule)
 {
   NS_DOCUMENT_NOTIFY_OBSERVERS(StyleRuleRemoved,
@@ -5789,16 +5782,16 @@ nsDocument::RegisterUnresolvedElement(Element* aElement, nsIAtom* aTypeName)
     return NS_OK;
   }
 
-  nsTArray<RefPtr<Element>>* unresolved;
+  nsTArray<nsWeakPtr>* unresolved;
   mRegistry->mCandidatesMap.Get(&key, &unresolved);
   if (!unresolved) {
-    unresolved = new nsTArray<RefPtr<Element>>();
+    unresolved = new nsTArray<nsWeakPtr>();
     // Ownership of unresolved is taken by mCandidatesMap.
     mRegistry->mCandidatesMap.Put(&key, unresolved);
   }
 
-  RefPtr<Element>* elem = unresolved->AppendElement();
-  *elem = aElement;
+  nsWeakPtr* elem = unresolved->AppendElement();
+  *elem = do_GetWeakReference(aElement);
   aElement->AddStates(NS_EVENT_STATE_UNRESOLVED);
 
   return NS_OK;
@@ -6182,11 +6175,14 @@ nsDocument::RegisterElement(JSContext* aCx, const nsAString& aType,
   definitions.Put(&key, definition);
 
   // Do element upgrade.
-  nsAutoPtr<nsTArray<RefPtr<Element>>> candidates;
+  nsAutoPtr<nsTArray<nsWeakPtr>> candidates;
   mRegistry->mCandidatesMap.RemoveAndForget(&key, candidates);
   if (candidates) {
     for (size_t i = 0; i < candidates->Length(); ++i) {
-      Element *elem = candidates->ElementAt(i);
+      nsCOMPtr<Element> elem = do_QueryReferent(candidates->ElementAt(i));
+      if (!elem) {
+        continue;
+      }
 
       elem->RemoveStates(NS_EVENT_STATE_UNRESOLVED);
 
@@ -6394,13 +6390,11 @@ nsIDocument::GetSelectedStyleSheetSet(nsAString& aSheetSet)
   int32_t count = GetNumberOfStyleSheets();
   nsAutoString title;
   for (int32_t index = 0; index < count; index++) {
-    nsIStyleSheet* sheet = GetStyleSheetAt(index);
+    CSSStyleSheet* sheet = GetStyleSheetAt(index);
     NS_ASSERTION(sheet, "Null sheet in sheet list!");
 
-    nsCOMPtr<nsIDOMStyleSheet> domSheet = do_QueryInterface(sheet);
-    NS_ASSERTION(domSheet, "Sheet must QI to nsIDOMStyleSheet");
     bool disabled;
-    domSheet->GetDisabled(&disabled);
+    sheet->GetDisabled(&disabled);
     if (disabled) {
       // Disabled sheets don't affect the currently selected set
       continue;
@@ -6510,7 +6504,7 @@ nsDocument::EnableStyleSheetsForSetInternal(const nsAString& aSheetSet,
   int32_t count = GetNumberOfStyleSheets();
   nsAutoString title;
   for (int32_t index = 0; index < count; index++) {
-    nsIStyleSheet* sheet = GetStyleSheetAt(index);
+    CSSStyleSheet* sheet = GetStyleSheetAt(index);
     NS_ASSERTION(sheet, "Null sheet in sheet list!");
     sheet->GetTitle(title);
     if (!title.IsEmpty()) {
@@ -10041,8 +10035,6 @@ nsIDocument::RegisterActivityObserver(nsISupports* aSupports)
 {
   if (!mActivityObservers) {
     mActivityObservers = new nsTHashtable<nsPtrHashKey<nsISupports> >();
-    if (!mActivityObservers)
-      return;
   }
   mActivityObservers->PutEntry(aSupports);
 }
@@ -10139,7 +10131,7 @@ nsIDocument::CreateStaticClone(nsIDocShell* aCloneContainer)
 
       int32_t sheetsCount = GetNumberOfStyleSheets();
       for (int32_t i = 0; i < sheetsCount; ++i) {
-        RefPtr<CSSStyleSheet> sheet = do_QueryObject(GetStyleSheetAt(i));
+        RefPtr<CSSStyleSheet> sheet = GetStyleSheetAt(i);
         if (sheet) {
           if (sheet->IsApplicable()) {
             RefPtr<CSSStyleSheet> clonedSheet =
@@ -10152,11 +10144,8 @@ nsIDocument::CreateStaticClone(nsIDocShell* aCloneContainer)
         }
       }
 
-      sheetsCount = thisAsDoc->mOnDemandBuiltInUASheets.Count();
       // Iterate backwards to maintain order
-      for (int32_t i = sheetsCount - 1; i >= 0; --i) {
-        RefPtr<CSSStyleSheet> sheet =
-          do_QueryObject(thisAsDoc->mOnDemandBuiltInUASheets[i]);
+      for (CSSStyleSheet* sheet : Reversed(thisAsDoc->mOnDemandBuiltInUASheets)) {
         if (sheet) {
           if (sheet->IsApplicable()) {
             RefPtr<CSSStyleSheet> clonedSheet =
@@ -12230,6 +12219,16 @@ nsDocument::Observe(nsISupports *aSubject,
       // We don't want to style the chrome window, only app ones.
       OnAppThemeChanged();
     }
+  } else if (strcmp("service-worker-get-client", aTopic) == 0) {
+    nsAutoString clientId;
+    GetOrCreateId(clientId);
+    if (!clientId.IsEmpty() && clientId.Equals(aData)) {
+      nsCOMPtr<nsISupportsInterfacePointer> ifptr = do_QueryInterface(aSubject);
+      if (ifptr) {
+        ifptr->SetData(static_cast<nsIDocument*>(this));
+        ifptr->SetDataIID(&NS_GET_IID(nsIDocument));
+      }
+    }
   }
   return NS_OK;
 }
@@ -12244,7 +12243,7 @@ nsDocument::OnAppThemeChanged()
   }
 
   for (int32_t i = 0; i < GetNumberOfStyleSheets(); i++) {
-    RefPtr<CSSStyleSheet> sheet =  do_QueryObject(GetStyleSheetAt(i));
+    RefPtr<CSSStyleSheet> sheet = GetStyleSheetAt(i);
     if (!sheet) {
       continue;
     }
@@ -12611,15 +12610,19 @@ nsIDocument::DocAddSizeOfIncludingThis(nsWindowSizes* aWindowSizes) const
 }
 
 static size_t
-SizeOfStyleSheetsElementIncludingThis(nsIStyleSheet* aStyleSheet,
-                                      MallocSizeOf aMallocSizeOf,
-                                      void* aData)
+SizeOfOwnedSheetArrayExcludingThis(const nsTArray<RefPtr<CSSStyleSheet>>& aSheets,
+                                   MallocSizeOf aMallocSizeOf)
 {
-  if (!aStyleSheet->GetOwningDocument()) {
-    // Avoid over-reporting shared sheets.
-    return 0;
+  size_t n = 0;
+  n += aSheets.ShallowSizeOfExcludingThis(aMallocSizeOf);
+  for (CSSStyleSheet* sheet : aSheets) {
+    if (!sheet->GetOwningDocument()) {
+      // Avoid over-reporting shared sheets.
+      continue;
+    }
+    n += sheet->SizeOfIncludingThis(aMallocSizeOf);
   }
-  return aStyleSheet->SizeOfIncludingThis(aMallocSizeOf);
+  return n;
 }
 
 size_t
@@ -12670,26 +12673,18 @@ nsDocument::DocAddSizeOfExcludingThis(nsWindowSizes* aWindowSizes) const
   }
 
   aWindowSizes->mStyleSheetsSize +=
-    mStyleSheets.SizeOfExcludingThis(SizeOfStyleSheetsElementIncludingThis,
-                                     aWindowSizes->mMallocSizeOf);
+    SizeOfOwnedSheetArrayExcludingThis(mStyleSheets,
+                                       aWindowSizes->mMallocSizeOf);
   // Note that we do not own the sheets pointed to by mOnDemandBuiltInUASheets
-  // (the nsLayoutStyleSheetCache singleton does) so pass nullptr as the
-  // aSizeOfElementIncludingThis callback argument.
+  // (the nsLayoutStyleSheetCache singleton does).
   aWindowSizes->mStyleSheetsSize +=
-    mOnDemandBuiltInUASheets.SizeOfExcludingThis(nullptr,
-                                                 aWindowSizes->mMallocSizeOf);
-  aWindowSizes->mStyleSheetsSize +=
-    mAdditionalSheets[eAgentSheet].
-      SizeOfExcludingThis(SizeOfStyleSheetsElementIncludingThis,
-                          aWindowSizes->mMallocSizeOf);
-  aWindowSizes->mStyleSheetsSize +=
-    mAdditionalSheets[eUserSheet].
-      SizeOfExcludingThis(SizeOfStyleSheetsElementIncludingThis,
-                          aWindowSizes->mMallocSizeOf);
-  aWindowSizes->mStyleSheetsSize +=
-    mAdditionalSheets[eAuthorSheet].
-      SizeOfExcludingThis(SizeOfStyleSheetsElementIncludingThis,
-                          aWindowSizes->mMallocSizeOf);
+    mOnDemandBuiltInUASheets.ShallowSizeOfExcludingThis(
+        aWindowSizes->mMallocSizeOf);
+  for (auto& sheetArray : mAdditionalSheets) {
+    aWindowSizes->mStyleSheetsSize +=
+      SizeOfOwnedSheetArrayExcludingThis(sheetArray,
+                                         aWindowSizes->mMallocSizeOf);
+  }
   // Lumping in the loader with the style-sheets size is not ideal,
   // but most of the things in there are in fact stylesheets, so it
   // doesn't seem worthwhile to separate it out.
@@ -13085,33 +13080,45 @@ nsIDocument::CreateHTMLElement(nsIAtom* aTag)
   return element.forget();
 }
 
+/* static */
 nsresult
-nsIDocument::GetId(nsAString& aId)
+nsIDocument::GenerateDocumentId(nsAString& aId)
+{
+  nsID id;
+  nsresult rv = nsContentUtils::GenerateUUIDInPlace(id);
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return rv;
+  }
+
+  // Build a string in {xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx} format
+  char buffer[NSID_LENGTH];
+  id.ToProvidedString(buffer);
+  NS_ConvertASCIItoUTF16 uuid(buffer);
+
+  // Remove {} and the null terminator
+  aId.Assign(Substring(uuid, 1, NSID_LENGTH - 3));
+  return NS_OK;
+}
+
+nsresult
+nsIDocument::GetOrCreateId(nsAString& aId)
 {
   if (mId.IsEmpty()) {
-    nsresult rv;
-    nsCOMPtr<nsIUUIDGenerator> uuidgen = do_GetService("@mozilla.org/uuid-generator;1", &rv);
+    nsresult rv = GenerateDocumentId(mId);
     if (NS_WARN_IF(NS_FAILED(rv))) {
       return rv;
     }
-
-    nsID id;
-    rv = uuidgen->GenerateUUIDInPlace(&id);
-    if (NS_WARN_IF(NS_FAILED(rv))) {
-      return rv;
-    }
-
-    // Build a string in {xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx} format
-    char buffer[NSID_LENGTH];
-    id.ToProvidedString(buffer);
-    NS_ConvertASCIItoUTF16 uuid(buffer);
-
-    // Remove {} and the null terminator
-    mId.Assign(Substring(uuid, 1, NSID_LENGTH - 3));
   }
 
   aId = mId;
   return NS_OK;
+}
+
+void
+nsIDocument::SetId(const nsAString& aId)
+{
+  MOZ_ASSERT(mId.IsEmpty(), "Cannot set the document ID after we have one");
+  mId = aId;
 }
 
 bool

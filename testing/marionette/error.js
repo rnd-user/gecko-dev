@@ -54,11 +54,6 @@ const XPCOM_EXCEPTIONS = [];
 this.error = {};
 
 /**
- * Determines if the given status is successful.
- */
-error.isSuccess = status => status === "success";
-
-/**
  * Checks if obj is an instance of the Error prototype in a safe manner.
  * Prefer using this over using instanceof since the Error prototype
  * isn't unique across browsers, and XPCOM exceptions are special
@@ -112,6 +107,24 @@ error.stringify = function(err) {
   } catch (e) {
     return "<unprintable error>";
   }
+};
+
+/**
+ * Marshal an Error to a JSON structure.
+ *
+ * @param {Error} err
+ *     The Error to serialise.
+ *
+ * @return {Object.<string, Object>}
+ *     JSON structure with the keys "error", "message", and "stacktrace".
+ */
+error.toJson = function(err) {
+  let json = {
+    error: err.status,
+    message: err.message || null,
+    stacktrace: err.stack || null,
+  };
+  return json;
 };
 
 /**
@@ -221,7 +234,7 @@ this.NoAlertOpenError = function(msg) {
   WebDriverError.call(this, msg);
   this.name = "NoAlertOpenError";
   this.status = "no such alert";
-}
+};
 NoAlertOpenError.prototype = Object.create(WebDriverError.prototype);
 
 this.NoSuchElementError = function(msg) {

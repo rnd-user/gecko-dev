@@ -161,13 +161,6 @@ Hash(const char *buf, nsACString &hash)
     return NS_OK;
 }
 
-bool IsRedirectStatus(uint32_t status)
-{
-    // 305 disabled as a security measure (see bug 187996).
-    return status == 300 || status == 301 || status == 302 || status == 303 ||
-           status == 307 || status == 308;
-}
-
 } // unnamed namespace
 
 // We only treat 3xx responses as redirects if they have a Location header and
@@ -175,7 +168,7 @@ bool IsRedirectStatus(uint32_t status)
 bool
 WillRedirect(const nsHttpResponseHead * response)
 {
-    return IsRedirectStatus(response->Status()) &&
+    return nsHttpChannel::IsRedirectStatus(response->Status()) &&
            response->PeekHeader(nsHttp::Location);
 }
 
@@ -332,7 +325,12 @@ nsHttpChannel::Connect()
         // the CSP directive 'upgrade-insecure-requests', then it's time to fulfill
         // the promise to CSP and mixed content blocking to upgrade the channel
         // from http to https.
-        if (mLoadInfo && mLoadInfo->GetUpgradeInsecureRequests()) {
+        if (mLoadInfo) {
+            bool isPreload = nsContentUtils::IsPreloadType(mLoadInfo->InternalContentPolicyType());
+            bool upgradeRequests =
+              ((isPreload && mLoadInfo->GetUpgradeInsecurePreloads()) ||
+               (mLoadInfo->GetUpgradeInsecureRequests()));
+
             // Please note that cross origin top level navigations are not subject
             // to upgrade-insecure-requests, see:
             // http://www.w3.org/TR/upgrade-insecure-requests/#examples
@@ -343,7 +341,7 @@ nsHttpChannel::Connect()
                 (mLoadInfo->GetExternalContentPolicyType() == nsIContentPolicy::TYPE_DOCUMENT) &&
                 (!resultPrincipal->Equals(mLoadInfo->LoadingPrincipal()));
 
-            if (!crossOriginNavigation) {
+            if (upgradeRequests && !crossOriginNavigation) {
                 // let's log a message to the console that we are upgrading a request
                 nsAutoCString spec, scheme;
                 mURI->GetSpec(spec);
@@ -453,9 +451,7 @@ nsHttpChannel::ContinueConnect()
         mInterceptCache != INTERCEPTED) {
         MOZ_ASSERT(!mPreflightChannel);
         nsresult rv =
-            nsCORSListenerProxy::StartCORSPreflight(this,
-                                                    mPreflightPrincipal, this,
-                                                    mWithCredentials,
+            nsCORSListenerProxy::StartCORSPreflight(this, this,
                                                     mUnsafeHeaders,
                                                     getter_AddRefs(mPreflightChannel));
         return rv;
@@ -606,16 +602,27 @@ nsHttpChannel::ContinueHandleAsyncRedirect(nsresult rv)
         // If AsyncProcessRedirection fails, then we have to send out the
         // OnStart/OnStop notifications.
         LOG(("ContinueHandleAsyncRedirect got failure result [rv=%x]\n", rv));
-        mStatus = rv;
-        DoNotifyListener();
+
+        bool redirectsEnabled =
+            !mLoadInfo || !mLoadInfo->GetDontFollowRedirects();
+
+        if (redirectsEnabled) {
+            // TODO: stop failing original channel if redirect vetoed?
+            mStatus = rv;
+
+            DoNotifyListener();
+
+            // Blow away cache entry if we couldn't process the redirect
+            // for some reason (the cache entry might be corrupt).
+            if (mCacheEntry) {
+                mCacheEntry->AsyncDoom(nullptr);
+            }
+        }
+        else {
+            DoNotifyListener();
+        }
     }
 
-    // close the cache entry.  Blow it away if we couldn't process the redirect
-    // for some reason (the cache entry might be corrupt).
-    if (mCacheEntry) {
-        if (NS_FAILED(rv))
-            mCacheEntry->AsyncDoom(nullptr);
-    }
     CloseCacheEntry(false);
 
     mIsPending = false;
@@ -4982,8 +4989,11 @@ nsHttpChannel::GetSecurityInfo(nsISupports **securityInfo)
 NS_IMETHODIMP
 nsHttpChannel::AsyncOpen(nsIStreamListener *listener, nsISupports *context)
 {
-    MOZ_ASSERT(!mLoadInfo || mLoadInfo->GetSecurityMode() == 0 ||
-               mLoadInfo->GetInitialSecurityCheckDone(),
+    MOZ_ASSERT(!mLoadInfo ||
+               mLoadInfo->GetSecurityMode() == 0 ||
+               mLoadInfo->GetInitialSecurityCheckDone() ||
+               (mLoadInfo->GetSecurityMode() == nsILoadInfo::SEC_ALLOW_CROSS_ORIGIN_DATA_IS_NULL &&
+                nsContentUtils::IsSystemPrincipal(mLoadInfo->LoadingPrincipal())),
                "security flags in loadInfo but asyncOpen2() not called");
 
     LOG(("nsHttpChannel::AsyncOpen [this=%p]\n", this));
@@ -7064,6 +7074,14 @@ nsHttpChannel::OnPush(const nsACString &url, Http2PushedStream *pushedStream)
     channel->SetPushedStream(pushedStream);
     rv = pushListener->OnPush(this, pushHttpChannel);
     return rv;
+}
+
+// static
+bool nsHttpChannel::IsRedirectStatus(uint32_t status)
+{
+    // 305 disabled as a security measure (see bug 187996).
+    return status == 300 || status == 301 || status == 302 || status == 303 ||
+           status == 307 || status == 308;
 }
 
 void

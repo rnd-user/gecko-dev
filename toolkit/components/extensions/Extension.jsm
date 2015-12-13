@@ -6,6 +6,8 @@
 
 this.EXPORTED_SYMBOLS = ["Extension", "ExtensionData"];
 
+/* globals Extension ExtensionData */
+
 /*
  * This file is the main entry point for extensions. When an extension
  * loads, its bootstrap.js file creates a Extension instance
@@ -21,8 +23,9 @@ const Cr = Components.results;
 
 Cu.import("resource://gre/modules/XPCOMUtils.jsm");
 Cu.import("resource://gre/modules/Services.jsm");
-Cu.import("resource://devtools/shared/event-emitter.js");
 
+XPCOMUtils.defineLazyModuleGetter(this, "EventEmitter",
+                                  "resource://devtools/shared/event-emitter.js");
 XPCOMUtils.defineLazyModuleGetter(this, "Locale",
                                   "resource://gre/modules/Locale.jsm");
 XPCOMUtils.defineLazyModuleGetter(this, "Log",
@@ -39,6 +42,8 @@ XPCOMUtils.defineLazyModuleGetter(this, "PrivateBrowsingUtils",
                                   "resource://gre/modules/PrivateBrowsingUtils.jsm");
 XPCOMUtils.defineLazyModuleGetter(this, "Preferences",
                                   "resource://gre/modules/Preferences.jsm");
+XPCOMUtils.defineLazyModuleGetter(this, "Schemas",
+                                  "resource://gre/modules/Schemas.jsm");
 XPCOMUtils.defineLazyModuleGetter(this, "Task",
                                   "resource://gre/modules/Task.jsm");
 
@@ -59,8 +64,14 @@ ExtensionManagement.registerScript("chrome://extensions/content/ext-webRequest.j
 ExtensionManagement.registerScript("chrome://extensions/content/ext-storage.js");
 ExtensionManagement.registerScript("chrome://extensions/content/ext-test.js");
 
+ExtensionManagement.registerSchema("chrome://extensions/content/schemas/cookies.json");
+ExtensionManagement.registerSchema("chrome://extensions/content/schemas/extension_types.json");
+ExtensionManagement.registerSchema("chrome://extensions/content/schemas/web_navigation.json");
+ExtensionManagement.registerSchema("chrome://extensions/content/schemas/web_request.json");
+
 Cu.import("resource://gre/modules/ExtensionUtils.jsm");
 var {
+  LocaleData,
   MessageBroker,
   Messenger,
   injectAPI,
@@ -72,19 +83,26 @@ const LOGGER_ID_BASE = "addons.webextension.";
 
 var scriptScope = this;
 
+var ExtensionPage, GlobalManager;
+
 // This object loads the ext-*.js scripts that define the extension API.
 var Management = {
-  initialized: false,
+  initialized: null,
   scopes: [],
   apis: [],
+  schemaApis: [],
   emitter: new EventEmitter(),
 
   // Loads all the ext-*.js scripts currently registered.
   lazyInit() {
     if (this.initialized) {
-      return;
+      return this.initialized;
     }
-    this.initialized = true;
+
+    let promises = [];
+    for (let schema of ExtensionManagement.getSchemas()) {
+      promises.push(Schemas.load(schema));
+    }
 
     for (let script of ExtensionManagement.getScripts()) {
       let scope = {extensions: this,
@@ -96,6 +114,9 @@ var Management = {
       // Save the scope to avoid it being garbage collected.
       this.scopes.push(scope);
     }
+
+    this.initialized = Promise.all(promises);
+    return this.initialized;
   },
 
   // Called by an ext-*.js script to register an API. The |api|
@@ -117,9 +138,13 @@ var Management = {
     this.apis.push({api, permission});
   },
 
+  registerSchemaAPI(namespace, permission, api) {
+    this.schemaApis.push({namespace, permission, api});
+  },
+
   // Mash together into a single object all the APIs registered by the
   // functions above. Return the merged object.
-  generateAPIs(extension, context) {
+  generateAPIs(extension, context, apis) {
     let obj = {};
 
     // Recursively copy properties from source to dest.
@@ -136,7 +161,7 @@ var Management = {
       }
     }
 
-    for (let api of this.apis) {
+    for (let api of apis) {
       if (api.permission) {
         if (!extension.hasPermission(api.permission)) {
           continue;
@@ -157,13 +182,12 @@ var Management = {
 
   // Ask to run all the callbacks that are registered for a given hook.
   emit(hook, ...args) {
-    this.lazyInit();
     this.emitter.emit(hook, ...args);
   },
 
   off(hook, callback) {
     this.emitter.off(hook, callback);
-  }
+  },
 };
 
 // A MessageBroker that's used to send and receive messages for
@@ -181,9 +205,8 @@ var globalBroker = new MessageBroker([Services.mm, Services.ppmm]);
 // |uri| is the URI of the content (optional).
 // |docShell| is the docshell the content runs in (optional).
 // |incognito| is the content running in a private context (default: false).
-function ExtensionPage(extension, params)
-{
-  let {type, contentWindow, uri, docShell} = params;
+ExtensionPage = function(extension, params) {
+  let {type, contentWindow, uri} = params;
   this.extension = extension;
   this.type = type;
   this.contentWindow = contentWindow || null;
@@ -204,11 +227,34 @@ function ExtensionPage(extension, params)
   this.messenger = new Messenger(this, globalBroker, sender, filter, delegate);
 
   this.extension.views.add(this);
-}
+};
 
 ExtensionPage.prototype = {
   get cloneScope() {
     return this.contentWindow;
+  },
+
+  get principal() {
+    return this.contentWindow.document.nodePrincipal;
+  },
+
+  checkLoadURL(url, options = {}) {
+    let ssm = Services.scriptSecurityManager;
+
+    let flags = ssm.STANDARD;
+    if (!options.allowScript) {
+      flags |= ssm.DISALLOW_SCRIPT;
+    }
+    if (!options.allowInheritsPrincipal) {
+      flags |= ssm.DISALLOW_INHERIT_PRINCIPAL;
+    }
+
+    try {
+      ssm.checkLoadURIStrWithPrincipal(this.principal, url, flags);
+    } catch (e) {
+      return false;
+    }
+    return true;
   },
 
   callOnClose(obj) {
@@ -239,7 +285,7 @@ ExtensionPage.prototype = {
 };
 
 // Responsible for loading extension APIs into the right globals.
-var GlobalManager = {
+GlobalManager = {
   // Number of extensions currently enabled.
   count: 0,
 
@@ -279,11 +325,39 @@ var GlobalManager = {
   },
 
   observe(contentWindow, topic, data) {
-    function inject(extension, context) {
+    let inject = (extension, context) => {
       let chromeObj = Cu.createObjectIn(contentWindow, {defineAs: "browser"});
       contentWindow.wrappedJSObject.chrome = contentWindow.wrappedJSObject.browser;
-      let api = Management.generateAPIs(extension, context);
+      let api = Management.generateAPIs(extension, context, Management.apis);
       injectAPI(api, chromeObj);
+
+      let schemaApi = Management.generateAPIs(extension, context, Management.schemaApis);
+      let schemaWrapper = {
+        callFunction(ns, name, args) {
+          return schemaApi[ns][name].apply(null, args);
+        },
+
+        addListener(ns, name, listener, args) {
+          return schemaApi[ns][name].addListener.call(null, listener, ...args);
+        },
+        removeListener(ns, name, listener) {
+          return schemaApi[ns][name].removeListener.call(null, listener);
+        },
+        hasListener(ns, name, listener) {
+          return schemaApi[ns][name].hasListener.call(null, listener);
+        },
+      };
+      Schemas.inject(chromeObj, schemaWrapper);
+    };
+
+    // Find the add-on associated with this document via the
+    // principal's originAttributes. This value is computed by
+    // extensionURIToAddonID, which ensures that we don't inject our
+    // API into webAccessibleResources or remote web pages.
+    let principal = contentWindow.document.nodePrincipal;
+    let id = principal.originAttributes.addonId;
+    if (!this.extensionMap.has(id)) {
+      return;
     }
 
     let docShell = contentWindow.QueryInterface(Ci.nsIInterfaceRequestor)
@@ -294,7 +368,7 @@ var GlobalManager = {
 
     if (this.docShells.has(docShell)) {
       let {extension, context} = this.docShells.get(docShell);
-      if (context) {
+      if (context && extension.id == id) {
         inject(extension, context);
       }
       return;
@@ -302,16 +376,6 @@ var GlobalManager = {
 
     // We don't inject into sub-frames of a UI page.
     if (contentWindow != contentWindow.top) {
-      return;
-    }
-
-    // Find the add-on associated with this document via the
-    // principal's originAttributes. This value is computed by
-    // extensionURIToAddonID, which ensures that we don't inject our
-    // API into webAccessibleResources.
-    let principal = contentWindow.document.nodePrincipal;
-    let id = principal.originAttributes.addonId;
-    if (!this.extensionMap.has(id)) {
       return;
     }
     let extension = this.extensionMap.get(id);
@@ -322,7 +386,10 @@ var GlobalManager = {
 
     let eventHandler = docShell.chromeEventHandler;
     let listener = event => {
-      eventHandler.removeEventListener("unload", listener);
+      if (event.target != docShell.contentViewer.DOMDocument) {
+        return;
+      }
+      eventHandler.removeEventListener("unload", listener, true);
       context.unload();
     };
     eventHandler.addEventListener("unload", listener, true);
@@ -337,22 +404,16 @@ var GlobalManager = {
 //
 // No functionality of this class is guaranteed to work before
 // |readManifest| has been called, and completed.
-this.ExtensionData = function(rootURI)
-{
+this.ExtensionData = function(rootURI) {
   this.rootURI = rootURI;
 
   this.manifest = null;
   this.id = null;
-  // Map(locale-name -> message-map)
-  // Contains a key for each loaded locale, each of which is a
-  // JSON-compatible object with a property for each message
-  // in that locale.
-  this.localeMessages = new Map();
-  this.selectedLocale = null;
+  this.localeData = null;
   this._promiseLocales = null;
 
   this.errors = [];
-}
+};
 
 ExtensionData.prototype = {
   get logger() {
@@ -371,96 +432,6 @@ ExtensionData.prototype = {
     this.logger.error(`Loading extension '${this.id}': ${message}`);
   },
 
-  // https://developer.chrome.com/extensions/i18n
-  localizeMessage(message, substitutions, locale = this.selectedLocale) {
-    let messages = {};
-    if (this.localeMessages.has(locale)) {
-      messages = this.localeMessages.get(locale);
-    }
-
-    if (message in messages) {
-      let str = messages[message].message;
-
-      if (!substitutions) {
-        substitutions = [];
-      } else if (!Array.isArray(substitutions)) {
-        substitutions = [substitutions];
-      }
-
-      // https://developer.chrome.com/extensions/i18n-messages
-      // |str| may contain substrings of the form $1 or $PLACEHOLDER$.
-      // In the former case, we replace $n with substitutions[n - 1].
-      // In the latter case, we consult the placeholders array.
-      // The placeholder may itself use $n to refer to substitutions.
-      let replacer = (matched, name) => {
-        if (name.length == 1 && name[0] >= '1' && name[0] <= '9') {
-          return substitutions[parseInt(name) - 1];
-        } else {
-          let content = messages[message].placeholders[name].content;
-          if (content[0] == '$') {
-            return replacer(matched, content[1]);
-          } else {
-            return content;
-          }
-        }
-      };
-      return str.replace(/\$([A-Za-z_@]+)\$/, replacer)
-                .replace(/\$([0-9]+)/, replacer)
-                .replace(/\$\$/, "$");
-    }
-
-    // Check for certain pre-defined messages.
-    if (message == "@@extension_id") {
-      if ("uuid" in this) {
-        // Per Chrome, this isn't available before an ID is guaranteed
-        // to have been assigned, namely, in manifest files.
-        // This should only be present in instances of the |Extension|
-        // subclass.
-        return this.uuid;
-      }
-    } else if (message == "@@ui_locale") {
-      return Locale.getLocale();
-    } else if (message == "@@bidi_dir") {
-      return "ltr"; // FIXME
-    }
-
-    Cu.reportError(`Unknown localization message ${message}`);
-    return "??";
-  },
-
-  // Localize a string, replacing all |__MSG_(.*)__| tokens with the
-  // matching string from the current locale, as determined by
-  // |this.selectedLocale|.
-  //
-  // This may not be called before calling either |initLocale| or
-  // |initAllLocales|.
-  localize(str, locale = this.selectedLocale) {
-    if (!str) {
-      return str;
-    }
-
-    return str.replace(/__MSG_([A-Za-z0-9@_]+?)__/g, (matched, message) => {
-      return this.localizeMessage(message, [], locale);
-    });
-  },
-
-  // If a "default_locale" is specified in that manifest, returns it
-  // as a Gecko-compatible locale string. Otherwise, returns null.
-  get defaultLocale() {
-    if ("default_locale" in this.manifest) {
-      return this.normalizeLocaleCode(this.manifest.default_locale);
-    }
-
-    return null;
-  },
-
-  // Normalizes a Chrome-compatible locale code to the appropriate
-  // Gecko-compatible variant. Currently, this means simply
-  // replacing underscores with hyphens.
-  normalizeLocaleCode(locale) {
-    return String.replace(locale, /_/g, "-");
-  },
-
   readDirectory: Task.async(function* (path) {
     if (this.rootURI instanceof Ci.nsIFileURL) {
       let uri = NetUtil.newURI(this.rootURI.resolve("./" + path));
@@ -473,11 +444,12 @@ ExtensionData.prototype = {
         yield iter.forEach(entry => {
           results.push(entry);
         });
-      } catch (e) {}
+      } catch (e) {
+        // Always return a list, even if the directory does not exist (or is
+        // not a directory) for symmetry with the ZipReader behavior.
+      }
       iter.close();
 
-      // Always return a list, even if the directory does not exist (or is
-      // not a directory) for symmetry with the ZipReader behavior.
       return results;
     }
 
@@ -555,7 +527,9 @@ ExtensionData.prototype = {
 
       try {
         this.id = this.manifest.applications.gecko.id;
-      } catch (e) {}
+      } catch (e) {
+        // Errors are handled by the type check below.
+      }
 
       if (typeof this.id != "string") {
         this.manifestError("Missing required `applications.gecko.id` property");
@@ -565,6 +539,31 @@ ExtensionData.prototype = {
     });
   },
 
+  localizeMessage(...args) {
+    return this.localeData.localizeMessage(...args);
+  },
+
+  localize(...args) {
+    return this.localeData.localize(...args);
+  },
+
+  // If a "default_locale" is specified in that manifest, returns it
+  // as a Gecko-compatible locale string. Otherwise, returns null.
+  get defaultLocale() {
+    if ("default_locale" in this.manifest) {
+      return this.normalizeLocaleCode(this.manifest.default_locale);
+    }
+
+    return null;
+  },
+
+  // Normalizes a Chrome-compatible locale code to the appropriate
+  // Gecko-compatible variant. Currently, this means simply
+  // replacing underscores with hyphens.
+  normalizeLocaleCode(locale) {
+    return String.replace(locale, /_/g, "-");
+  },
+
   // Reads the locale file for the given Gecko-compatible locale code, and
   // stores its parsed contents in |this.localeMessages.get(locale)|.
   readLocaleFile: Task.async(function* (locale) {
@@ -572,15 +571,13 @@ ExtensionData.prototype = {
     let dir = locales.get(locale);
     let file = `_locales/${dir}/messages.json`;
 
-    let messages = {};
     try {
-      messages = yield this.readJSON(file);
+      let messages = yield this.readJSON(file);
+      return this.localeData.addLocale(locale, messages, this);
     } catch (e) {
       this.packagingError(`Loading locale file ${file}: ${e}`);
+      return new Map();
     }
-
-    this.localeMessages.set(locale, messages);
-    return messages;
   }),
 
   // Reads the list of locales available in the extension, and returns a
@@ -615,6 +612,7 @@ ExtensionData.prototype = {
   // as returned by |readLocaleFile|.
   initAllLocales: Task.async(function* () {
     let locales = yield this.promiseLocales();
+    this.localeData = new LocaleData({ defaultLocale: this.defaultLocale, locales });
 
     yield Promise.all(Array.from(locales.keys(),
                                  locale => this.readLocaleFile(locale)));
@@ -624,30 +622,42 @@ ExtensionData.prototype = {
       if (!locales.has(defaultLocale)) {
         this.manifestError('Value for "default_locale" property must correspond to ' +
                            'a directory in "_locales/". Not found: ' +
-                           JSON.stringify(`_locales/${default_locale}/`));
+                           JSON.stringify(`_locales/${this.manifest.default_locale}/`));
       }
-    } else if (this.localeMessages.size) {
+    } else if (locales.size) {
       this.manifestError('The "default_locale" property is required when a ' +
                          '"_locales/" directory is present.');
     }
 
-    return this.localeMessages;
+    return this.localeData.messages;
   }),
 
   // Reads the locale file for the given Gecko-compatible locale code, or the
   // default locale if no locale code is given, and sets it as the currently
   // selected locale on success.
   //
+  // Pre-loads the default locale for fallback message processing, regardless
+  // of the locale specified.
+  //
   // If no locales are unavailable, resolves to |null|.
   initLocale: Task.async(function* (locale = this.defaultLocale) {
+    this.localeData = new LocaleData({ defaultLocale: this.defaultLocale });
+
     if (locale == null) {
       return null;
     }
 
-    let localeData = yield this.readLocaleFile(locale);
+    let promises = [this.readLocaleFile(locale)];
 
-    this.selectedLocale = locale;
-    return localeData;
+    let { defaultLocale } = this;
+    if (locale != defaultLocale && !this.localeData.has(defaultLocale)) {
+      promises.push(this.readLocaleFile(defaultLocale));
+    }
+
+    let results = yield Promise.all(promises);
+
+    this.localeData.selectedLocale = locale;
+    return results[0];
   }),
 };
 
@@ -657,8 +667,7 @@ ExtensionData.prototype = {
 // installed (by trying to load a moz-extension URI referring to a
 // web_accessible_resource from the extension). getExtensionUUID
 // returns the UUID for a given add-on ID.
-function getExtensionUUID(id)
-{
+function getExtensionUUID(id) {
   const PREF_NAME = "extensions.webextensions.uuids";
 
   let pref = Preferences.get(PREF_NAME, "{}");
@@ -684,8 +693,7 @@ function getExtensionUUID(id)
 
 // We create one instance of this class per extension. |addonData|
 // comes directly from bootstrap.js when initializing.
-this.Extension = function(addonData)
-{
+this.Extension = function(addonData) {
   ExtensionData.call(this, addonData.resourceURI);
 
   this.uuid = getExtensionUUID(addonData.id);
@@ -714,7 +722,7 @@ this.Extension = function(addonData)
   this.webAccessibleResources = new Set();
 
   this.emitter = new EventEmitter();
-}
+};
 
 /**
  * This code is designed to make it easy to test a WebExtension
@@ -737,9 +745,11 @@ this.Extension = function(addonData)
  *
  * To make things easier, the value of "background" and "files"[] can
  * be a function, which is converted to source that is run.
+ *
+ * The generated extension is stored in the system temporary directory,
+ * and an nsIFile object pointing to it is returned.
  */
-this.Extension.generate = function(id, data)
-{
+this.Extension.generateXPI = function(id, data) {
   let manifest = data.manifest;
   if (!manifest) {
     manifest = {};
@@ -777,7 +787,7 @@ this.Extension.generate = function(id, data)
     files[bgScript] = data.background;
   }
 
-  provide(files, ["manifest.json"], JSON.stringify(manifest));
+  provide(files, ["manifest.json"], manifest);
 
   let ZipWriter = Components.Constructor("@mozilla.org/zipwriter;1", "nsIZipWriter");
   let zipW = new ZipWriter();
@@ -807,6 +817,8 @@ this.Extension.generate = function(id, data)
     let script = files[filename];
     if (typeof(script) == "function") {
       script = "(" + script.toString() + ")()";
+    } else if (typeof(script) == "object") {
+      script = JSON.stringify(script);
     }
 
     let stream = Cc["@mozilla.org/io/string-input-stream;1"].createInstance(Ci.nsIStringInputStream);
@@ -818,6 +830,16 @@ this.Extension.generate = function(id, data)
 
   zipW.close();
 
+  return file;
+};
+
+/**
+ * Generates a new extension using |Extension.generateXPI|, and initializes a
+ * new |Extension| instance which will execute it.
+ */
+this.Extension.generate = function(id, data) {
+  let file = this.generateXPI(id, data);
+
   flushJarCache(file);
   Services.ppmm.broadcastAsyncMessage("Extension:FlushJarCache", {path: file.path});
 
@@ -827,9 +849,9 @@ this.Extension.generate = function(id, data)
   return new Extension({
     id,
     resourceURI: jarURI,
-    cleanupFile: file
+    cleanupFile: file,
   });
-}
+};
 
 Extension.prototype = extend(Object.create(ExtensionData.prototype), {
   on(hook, f) {
@@ -871,9 +893,10 @@ Extension.prototype = extend(Object.create(ExtensionData.prototype), {
       manifest: this.manifest,
       resourceURL: this.addonData.resourceURI.spec,
       baseURL: this.baseURI.spec,
-      content_scripts: this.manifest.content_scripts || [],
+      content_scripts: this.manifest.content_scripts || [],  // eslint-disable-line camelcase
       webAccessibleResources: this.webAccessibleResources,
       whiteListedHosts: this.whiteListedHosts.serialize(),
+      localeData: this.localeData.serialize(),
     };
   },
 
@@ -897,10 +920,10 @@ Extension.prototype = extend(Object.create(ExtensionData.prototype), {
 
     let whitelist = [];
     for (let perm of permissions) {
-      if (perm.match(/:\/\//)) {
-        whitelist.push(perm);
-      } else {
+      if (/^\w+(\.\w+)*$/.test(perm)) {
         this.permissions.add(perm);
+      } else {
+        whitelist.push(perm);
       }
     }
     this.whiteListedHosts = new MatchPattern(whitelist);
@@ -940,7 +963,7 @@ Extension.prototype = extend(Object.create(ExtensionData.prototype), {
     if (locale === undefined) {
       let locales = yield this.promiseLocales();
 
-      let localeList = Object.keys(locales).map(locale => {
+      let localeList = Array.from(locales.keys(), locale => {
         return { name: locale, locales: [locale] };
       });
 
@@ -958,7 +981,11 @@ Extension.prototype = extend(Object.create(ExtensionData.prototype), {
       return Promise.reject(e);
     }
 
-    return this.readManifest().then(() => {
+    let lazyInit = Management.lazyInit();
+
+    return lazyInit.then(() => {
+      return this.readManifest();
+    }).then(() => {
       return this.initLocale();
     }).then(() => {
       if (this.hasShutdown) {
@@ -971,7 +998,7 @@ Extension.prototype = extend(Object.create(ExtensionData.prototype), {
 
       return this.runManifest(this.manifest);
     }).catch(e => {
-      dump(`Extension error: ${e} ${e.filename}:${e.lineNumber}\n`);
+      dump(`Extension error: ${e} ${e.filename || e.fileName}:${e.lineNumber}\n`);
       Cu.reportError(e);
       throw e;
     });

@@ -77,8 +77,8 @@ using namespace mozilla::widget;
 // Two types of focus pr logging are available:
 //   'Focus' for normal focus manager calls
 //   'FocusNavigation' for tab and document navigation
-PRLogModuleInfo* gFocusLog;
-PRLogModuleInfo* gFocusNavigationLog;
+LazyLogModule gFocusLog("Focus");
+LazyLogModule gFocusNavigationLog("FocusNavigation");
 
 #define LOGFOCUS(args) MOZ_LOG(gFocusLog, mozilla::LogLevel::Debug, args)
 #define LOGFOCUSNAVIGATION(args) MOZ_LOG(gFocusNavigationLog, mozilla::LogLevel::Debug, args)
@@ -190,12 +190,8 @@ nsresult
 nsFocusManager::Init()
 {
   nsFocusManager* fm = new nsFocusManager();
-  NS_ENSURE_TRUE(fm, NS_ERROR_OUT_OF_MEMORY);
   NS_ADDREF(fm);
   sInstance = fm;
-
-  gFocusLog = PR_NewLogModule("Focus");
-  gFocusNavigationLog = PR_NewLogModule("FocusNavigation");
 
   nsIContent::sTabFocusModelAppliesToXUL =
     Preferences::GetBool("accessibility.tabfocus_applies_to_xul",
@@ -352,7 +348,9 @@ nsFocusManager::GetRedirectedFocus(nsIContent* aContent)
 InputContextAction::Cause
 nsFocusManager::GetFocusMoveActionCause(uint32_t aFlags)
 {
-  if (aFlags & nsIFocusManager::FLAG_BYMOUSE) {
+  if (aFlags & nsIFocusManager::FLAG_BYTOUCH) {
+    return InputContextAction::CAUSE_TOUCH;
+  } else if (aFlags & nsIFocusManager::FLAG_BYMOUSE) {
     return InputContextAction::CAUSE_MOUSE;
   } else if (aFlags & nsIFocusManager::FLAG_BYKEY) {
     return InputContextAction::CAUSE_KEY;
@@ -2828,6 +2826,11 @@ nsFocusManager::DetermineElementToMoveFocus(nsPIDOMWindow* aWindow,
         nsIContent* root = GetRootForFocus(piWindow, doc, true, true);
         return FocusFirst(root, aNextContent);
       }
+
+      // Once we have hit the top-level and have iterated to the end again, we
+      // just want to break out next time we hit this spot to prevent infinite
+      // iteration.
+      mayFocusRoot = true;
 
       // reset the tab index and start again from the beginning or end
       startContent = rootContent;

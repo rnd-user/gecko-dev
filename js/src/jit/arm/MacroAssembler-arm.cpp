@@ -1969,18 +1969,6 @@ MacroAssemblerARMCompat::add32(Imm32 imm, const Address& dest)
 }
 
 void
-MacroAssemblerARMCompat::sub32(Imm32 imm, Register dest)
-{
-    ma_sub(imm, dest, SetCC);
-}
-
-void
-MacroAssemblerARMCompat::sub32(Register src, Register dest)
-{
-    ma_sub(src, dest, SetCC);
-}
-
-void
 MacroAssemblerARMCompat::addPtr(Register src, Register dest)
 {
     ma_add(src, dest);
@@ -2031,7 +2019,7 @@ MacroAssemblerARMCompat::movePtr(ImmPtr imm, Register dest)
 }
 
 void
-MacroAssemblerARMCompat::movePtr(AsmJSImmPtr imm, Register dest)
+MacroAssemblerARMCompat::movePtr(wasm::SymbolicAddress imm, Register dest)
 {
     RelocStyle rs;
     if (HasMOVWT())
@@ -2039,7 +2027,7 @@ MacroAssemblerARMCompat::movePtr(AsmJSImmPtr imm, Register dest)
     else
         rs = L_LDR;
 
-    append(AsmJSAbsoluteLink(CodeOffsetLabel(currentOffset()), imm.kind()));
+    append(AsmJSAbsoluteLink(CodeOffset(currentOffset()), imm));
     ma_movPatchable(Imm32(-1), dest, Always, rs);
 }
 
@@ -2201,10 +2189,10 @@ MacroAssemblerARMCompat::loadPtr(AbsoluteAddress address, Register dest)
 }
 
 void
-MacroAssemblerARMCompat::loadPtr(AsmJSAbsoluteAddress address, Register dest)
+MacroAssemblerARMCompat::loadPtr(wasm::SymbolicAddress address, Register dest)
 {
     MOZ_ASSERT(dest != pc); // Use dest as a scratch register.
-    movePtr(AsmJSImmPtr(address.kind()), dest);
+    movePtr(address, dest);
     loadPtr(Address(dest, 0), dest);
 }
 
@@ -4103,16 +4091,16 @@ MacroAssemblerARMCompat::ceilf(FloatRegister input, Register output, Label* bail
     bind(&fin);
 }
 
-CodeOffsetLabel
+CodeOffset
 MacroAssemblerARMCompat::toggledJump(Label* label)
 {
     // Emit a B that can be toggled to a CMP. See ToggleToJmp(), ToggleToCmp().
     BufferOffset b = ma_b(label, Always);
-    CodeOffsetLabel ret(b.getOffset());
+    CodeOffset ret(b.getOffset());
     return ret;
 }
 
-CodeOffsetLabel
+CodeOffset
 MacroAssemblerARMCompat::toggledCall(JitCode* target, bool enabled)
 {
     BufferOffset bo = nextOffset();
@@ -4123,7 +4111,7 @@ MacroAssemblerARMCompat::toggledCall(JitCode* target, bool enabled)
         ma_blx(scratch);
     else
         ma_nop();
-    return CodeOffsetLabel(bo.getOffset());
+    return CodeOffset(bo.getOffset());
 }
 
 void
@@ -4840,9 +4828,6 @@ MacroAssemblerARMCompat::compareExchangeToTypedIntArray(Scalar::Type arrayType, 
       case Scalar::Uint8:
         compareExchange8ZeroExtend(mem, oldval, newval, output.gpr());
         break;
-      case Scalar::Uint8Clamped:
-        compareExchange8ZeroExtend(mem, oldval, newval, output.gpr());
-        break;
       case Scalar::Int16:
         compareExchange16SignExtend(mem, oldval, newval, output.gpr());
         break;
@@ -4883,9 +4868,6 @@ MacroAssemblerARMCompat::atomicExchangeToTypedIntArray(Scalar::Type arrayType, c
         atomicExchange8SignExtend(mem, value, output.gpr());
         break;
       case Scalar::Uint8:
-        atomicExchange8ZeroExtend(mem, value, output.gpr());
-        break;
-      case Scalar::Uint8Clamped:
         atomicExchange8ZeroExtend(mem, value, output.gpr());
         break;
       case Scalar::Int16:
@@ -5098,19 +5080,19 @@ MacroAssembler::reserveStack(uint32_t amount)
 // ===============================================================
 // Simple call functions.
 
-CodeOffsetLabel
+CodeOffset
 MacroAssembler::call(Register reg)
 {
     as_blx(reg);
-    return CodeOffsetLabel(currentOffset());
+    return CodeOffset(currentOffset());
 }
 
-CodeOffsetLabel
+CodeOffset
 MacroAssembler::call(Label* label)
 {
     // For now, assume that it'll be nearby.
     as_bl(label, Always);
-    return CodeOffsetLabel(currentOffset());
+    return CodeOffset(currentOffset());
 }
 
 void
@@ -5128,7 +5110,7 @@ MacroAssembler::call(ImmPtr imm)
 }
 
 void
-MacroAssembler::call(AsmJSImmPtr imm)
+MacroAssembler::call(wasm::SymbolicAddress imm)
 {
     movePtr(imm, CallReg);
     call(CallReg);
@@ -5150,12 +5132,12 @@ MacroAssembler::call(JitCode* c)
     callJitNoProfiler(scratch);
 }
 
-CodeOffsetLabel
+CodeOffset
 MacroAssembler::callWithPatch()
 {
     // For now, assume that it'll be nearby.
     as_bl(BOffImm(), Always, /* documentation */ nullptr);
-    return CodeOffsetLabel(currentOffset());
+    return CodeOffset(currentOffset());
 }
 void
 MacroAssembler::patchCall(uint32_t callerOffset, uint32_t calleeOffset)

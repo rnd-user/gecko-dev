@@ -158,8 +158,12 @@ WebConsoleActor.prototype =
   },
 
   /**
-   * The window we work with.
-   * @type nsIDOMWindow
+   * The window or sandbox we work with.
+   * Note that even if it is named `window` it refers to the current
+   * global we are debugging, which can be a Sandbox for addons
+   * or browser content toolbox.
+   *
+   * @type nsIDOMWindow or Sandbox
    */
   get window() {
     if (this.parentActor.isRootActor) {
@@ -423,16 +427,18 @@ WebConsoleActor.prototype =
    */
   makeDebuggeeValue: function WCA_makeDebuggeeValue(aValue, aUseObjectGlobal)
   {
-    let global = this.window;
     if (aUseObjectGlobal && typeof aValue == "object") {
       try {
-        global = Cu.getGlobalForObject(aValue);
+        let global = Cu.getGlobalForObject(aValue);
+        let dbgGlobal = this.dbg.makeGlobalObjectReference(global);
+        return dbgGlobal.makeDebuggeeValue(aValue);
       }
       catch (ex) {
-        // The above can throw an exception if aValue is not an actual object.
+        // The above can throw an exception if aValue is not an actual object
+        // or 'Object in compartment marked as invisible to Debugger'
       }
     }
-    let dbgGlobal = this.dbg.makeGlobalObjectReference(global);
+    let dbgGlobal = this.dbg.makeGlobalObjectReference(this.window);
     return dbgGlobal.makeDebuggeeValue(aValue);
   },
 
@@ -733,9 +739,21 @@ WebConsoleActor.prototype =
           if (!this.consoleAPIListener) {
             break;
           }
+
+          // See `window` definition. It isn't always a DOM Window.
+          let requestStartTime = this.window && this.window.performance ?
+            this.window.performance.timing.requestStart : 0;
+
           let cache = this.consoleAPIListener
                       .getCachedMessages(!this.parentActor.isRootActor);
           cache.forEach((aMessage) => {
+            // Filter out messages that came from a ServiceWorker but happened
+            // before the page was requested.
+            if (aMessage.innerID === "ServiceWorker" &&
+                requestStartTime > aMessage.timeStamp) {
+              return;
+            }
+
             let message = this.prepareConsoleMessageForRemote(aMessage);
             message._type = type;
             messages.push(message);
@@ -887,6 +905,7 @@ WebConsoleActor.prototype =
     let frameActorId = aRequest.frameActor;
     let dbgObject = null;
     let environment = null;
+    let hadDebuggee = false;
 
     // This is the case of the paused debugger
     if (frameActorId) {
@@ -902,11 +921,17 @@ WebConsoleActor.prototype =
     }
     // This is the general case (non-paused debugger)
     else {
-      dbgObject = this.dbg.makeGlobalObjectReference(this.evalWindow);
+      hadDebuggee = this.dbg.hasDebuggee(this.evalWindow);
+      dbgObject = this.dbg.addDebuggee(this.evalWindow);
     }
 
     let result = JSPropertyProvider(dbgObject, environment, aRequest.text,
                                     aRequest.cursor, frameActorId) || {};
+
+    if (!hadDebuggee && dbgObject) {
+      this.dbg.removeDebuggee(this.evalWindow);
+    }
+
     let matches = result.matches || [];
     let reqText = aRequest.text.substr(0, aRequest.cursor);
 
@@ -2080,6 +2105,7 @@ NetworkEventActor.prototype =
       updateType: "responseContent",
       mimeType: aContent.mimeType,
       contentSize: aContent.size,
+      encoding: aContent.encoding,
       transferredSize: aContent.transferredSize,
       discardResponseBody: aDiscardedResponseBody,
     };

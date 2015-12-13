@@ -59,8 +59,7 @@ nsSVGClipPathFrame::ApplyClipOrPaintClipMask(gfxContext& aContext,
         nsSVGPathGeometryElement* pathElement =
           static_cast<nsSVGPathGeometryElement*>(pathFrame->GetContent());
         gfxMatrix toChildsUserSpace = pathElement->
-          PrependLocalTransformsTo(mMatrixForChildren,
-                                   nsSVGElement::eUserSpaceToParent);
+          PrependLocalTransformsTo(mMatrixForChildren, eUserSpaceToParent);
         gfxMatrix newMatrix =
           aContext.CurrentMatrix().PreMultiply(toChildsUserSpace).NudgeToIntegers();
         if (!newMatrix.IsSingular()) {
@@ -137,8 +136,7 @@ nsSVGClipPathFrame::ApplyClipOrPaintClipMask(gfxContext& aContext,
       if (childContent->IsSVGElement()) {
         toChildsUserSpace =
           static_cast<const nsSVGElement*>(childContent)->
-            PrependLocalTransformsTo(mMatrixForChildren,
-                                     nsSVGElement::eUserSpaceToParent);
+            PrependLocalTransformsTo(mMatrixForChildren, eUserSpaceToParent);
       }
       SVGFrame->PaintSVG(aContext, toChildsUserSpace);
 
@@ -177,6 +175,11 @@ nsSVGClipPathFrame::GetClipMask(gfxContext& aReferenceContext, nsIFrame* aClippe
     aReferenceContext.SetMatrix(gfxMatrix());
     gfxRect rect = aReferenceContext.GetClipExtents();
     intRect = RoundedOut(ToRect(rect));
+  }
+
+  if (intRect.IsEmpty()) {
+    // We don't need to create a mask surface, all drawing is clipped anyway.
+    return nullptr;
   }
 
   RefPtr<DrawTarget> maskDT = aReferenceContext.GetDrawTarget()->CreateSimilarDrawTarget(intRect.Size(), SurfaceFormat::A8);
@@ -242,7 +245,7 @@ nsSVGClipPathFrame::PointIsInsideClipPath(nsIFrame* aClippedFrame,
     if (SVGFrame) {
       gfxPoint pointForChild = point;
       gfxMatrix m = static_cast<nsSVGElement*>(kid->GetContent())->
-        PrependLocalTransformsTo(gfxMatrix(), nsSVGElement::eUserSpaceToParent);
+        PrependLocalTransformsTo(gfxMatrix(), eUserSpaceToParent);
       if (!m.IsIdentity()) {
         if (!m.Invert()) {
           return false;

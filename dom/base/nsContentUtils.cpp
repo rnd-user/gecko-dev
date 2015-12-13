@@ -162,6 +162,7 @@
 #include "nsIURIWithPrincipal.h"
 #include "nsIURL.h"
 #include "nsIWebNavigation.h"
+#include "nsIWindowMediator.h"
 #include "nsIWordBreaker.h"
 #include "nsIXPConnect.h"
 #include "nsJSUtils.h"
@@ -2116,14 +2117,6 @@ nsContentUtils::IsCallerContentXBL()
     return xpc::IsContentXBLScope(c);
 }
 
-
-bool
-nsContentUtils::IsImageSrcSetDisabled()
-{
-  return Preferences::GetBool("dom.disable_image_src_set") &&
-         !IsCallerChrome();
-}
-
 // static
 bool
 nsContentUtils::LookupBindingMember(JSContext* aCx, nsIContent *aContent,
@@ -2713,11 +2706,7 @@ nsContentUtils::SubjectPrincipal()
   MOZ_ASSERT(NS_IsMainThread());
   JSContext* cx = GetCurrentJSContext();
   if (!cx) {
-#ifndef RELEASE_BUILD
     MOZ_CRASH("Accessing the Subject Principal without an AutoJSAPI on the stack is forbidden");
-#endif
-    Telemetry::Accumulate(Telemetry::SUBJECT_PRINCIPAL_ACCESSED_WITHOUT_SCRIPT_ON_STACK, true);
-    return GetSystemPrincipal();
   }
 
   JSCompartment *compartment = js::GetContextCompartment(cx);
@@ -5180,6 +5169,23 @@ nsContentUtils::GetWindowProviderForContentProcess()
 }
 
 /* static */
+already_AddRefed<nsPIDOMWindow>
+nsContentUtils::GetMostRecentNonPBWindow()
+{
+  nsCOMPtr<nsIWindowMediator> windowMediator =
+    do_GetService(NS_WINDOWMEDIATOR_CONTRACTID);
+  nsCOMPtr<nsIWindowMediator_44> wm = do_QueryInterface(windowMediator);
+
+  nsCOMPtr<nsIDOMWindow> window;
+  wm->GetMostRecentNonPBWindow(MOZ_UTF16("navigator:browser"),
+                               getter_AddRefs(window));
+  nsCOMPtr<nsPIDOMWindow> pwindow;
+  pwindow = do_QueryInterface(window);
+
+  return pwindow.forget();
+}
+
+/* static */
 void
 nsContentUtils::WarnScriptWasIgnored(nsIDocument* aDocument)
 {
@@ -6069,6 +6075,15 @@ nsContentTypeParser::GetParameter(const char* aParameterName, nsAString& aResult
                                     aResult);
 }
 
+nsresult
+nsContentTypeParser::GetType(nsAString& aResult)
+{
+  nsresult rv = GetParameter(nullptr, aResult);
+  NS_ENSURE_SUCCESS(rv, rv);
+  nsContentUtils::ASCIIToLower(aResult);
+  return NS_OK;
+}
+
 /* static */
 
 bool
@@ -6162,7 +6177,9 @@ nsContentUtils::CreateArrayBuffer(JSContext *aCx, const nsACString& aData,
   if (dataLen > 0) {
     NS_ASSERTION(JS_IsArrayBufferObject(*aResult), "What happened?");
     JS::AutoCheckCannotGC nogc;
-    memcpy(JS_GetArrayBufferData(*aResult, nogc), aData.BeginReading(), dataLen);
+    bool isShared;
+    memcpy(JS_GetArrayBufferData(*aResult, &isShared, nogc), aData.BeginReading(), dataLen);
+    MOZ_ASSERT(!isShared);
   }
 
   return NS_OK;
@@ -7510,7 +7527,9 @@ nsContentUtils::TransferableToIPCTransferable(nsITransferable* aTransferable,
               if (IsFileImage(file, type)) {
                 IPCDataTransferItem* item = aIPCDataTransfer->items().AppendElement();
                 item->flavor() = type;
-                SlurpFileToString(file, item->data());
+                nsAutoCString data;
+                SlurpFileToString(file, data);
+                item->data() = data;
               }
 
               continue;
@@ -7671,7 +7690,8 @@ nsContentUtils::ToWidgetPoint(const CSSPoint& aPoint,
                               nsPresContext* aPresContext)
 {
   return LayoutDeviceIntPoint::FromAppUnitsRounded(
-    CSSPoint::ToAppUnits(aPoint) + aOffset,
+    (CSSPoint::ToAppUnits(aPoint) +
+    aOffset).ApplyResolution(aPresContext->PresShell()->GetCumulativeNonRootScaleResolution()),
     aPresContext->AppUnitsPerDevPixel());
 }
 
@@ -8040,6 +8060,18 @@ nsContentUtils::InternalContentPolicyTypeToExternalOrWorker(nsContentPolicyType 
   default:
     return InternalContentPolicyTypeToExternal(aType);
   }
+}
+
+/* static */
+bool
+nsContentUtils::IsPreloadType(nsContentPolicyType aType)
+{
+  if (aType == nsIContentPolicy::TYPE_INTERNAL_SCRIPT_PRELOAD ||
+      aType == nsIContentPolicy::TYPE_INTERNAL_IMAGE_PRELOAD ||
+      aType == nsIContentPolicy::TYPE_INTERNAL_STYLESHEET_PRELOAD) {
+    return true;
+  }
+  return false;
 }
 
 /* static */

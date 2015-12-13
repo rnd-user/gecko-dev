@@ -20,16 +20,16 @@
 
 using namespace mozilla;
 
-static const nsCSSProps::KTableValue kOrientationKeywords[] = {
-  eCSSKeyword_portrait,                 NS_STYLE_ORIENTATION_PORTRAIT,
-  eCSSKeyword_landscape,                NS_STYLE_ORIENTATION_LANDSCAPE,
-  eCSSKeyword_UNKNOWN,                  -1
+static const nsCSSProps::KTableEntry kOrientationKeywords[] = {
+  { eCSSKeyword_portrait,                 NS_STYLE_ORIENTATION_PORTRAIT },
+  { eCSSKeyword_landscape,                NS_STYLE_ORIENTATION_LANDSCAPE },
+  { eCSSKeyword_UNKNOWN,                  -1 }
 };
 
-static const nsCSSProps::KTableValue kScanKeywords[] = {
-  eCSSKeyword_progressive,              NS_STYLE_SCAN_PROGRESSIVE,
-  eCSSKeyword_interlace,                NS_STYLE_SCAN_INTERLACE,
-  eCSSKeyword_UNKNOWN,                  -1
+static const nsCSSProps::KTableEntry kScanKeywords[] = {
+  { eCSSKeyword_progressive,              NS_STYLE_SCAN_PROGRESSIVE },
+  { eCSSKeyword_interlace,                NS_STYLE_SCAN_INTERLACE },
+  { eCSSKeyword_UNKNOWN,                  -1 }
 };
 
 #ifdef XP_WIN
@@ -372,7 +372,7 @@ GetWindowsTheme(nsPresContext* aPresContext, const nsMediaFeature* aFeature,
 }
 
 static nsresult
-GetOperatinSystemVersion(nsPresContext* aPresContext, const nsMediaFeature* aFeature,
+GetOperatingSystemVersion(nsPresContext* aPresContext, const nsMediaFeature* aFeature,
                          nsCSSValue& aResult)
 {
     aResult.Reset();
@@ -715,7 +715,7 @@ nsMediaFeatures::features[] = {
         nsMediaFeature::eIdent,
         nsMediaFeature::eNoRequirements,
         { nullptr },
-        GetOperatinSystemVersion
+        GetOperatingSystemVersion
     },
 
     {

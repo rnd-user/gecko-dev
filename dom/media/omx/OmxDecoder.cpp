@@ -37,7 +37,7 @@
 #define OD_LOG(...) __android_log_print(ANDROID_LOG_DEBUG, "OmxDecoder", __VA_ARGS__)
 
 #undef LOG
-PRLogModuleInfo *gOmxDecoderLog;
+mozilla::LazyLogModule gOmxDecoderLog("OmxDecoder");
 #define LOG(type, msg...) MOZ_LOG(gOmxDecoderLog, type, (msg))
 
 using namespace MPAPI;
@@ -102,10 +102,6 @@ static sp<IOMX> GetOMX()
 
 bool
 OmxDecoder::Init(sp<MediaExtractor>& extractor) {
-  if (!gOmxDecoderLog) {
-    gOmxDecoderLog = PR_NewLogModule("OmxDecoder");
-  }
-
   sp<MetaData> meta = extractor->getMetaData();
 
   ssize_t audioTrackIndex = -1;
@@ -358,10 +354,10 @@ OmxDecoder::ReleaseMediaResources() {
       for (std::set<TextureClient*>::iterator it=mPendingRecycleTexutreClients.begin();
            it!=mPendingRecycleTexutreClients.end(); it++)
       {
-        GrallocTextureClientOGL* client = static_cast<GrallocTextureClientOGL*>(*it);
-        client->ClearRecycleCallback();
+        GrallocTextureData* client = static_cast<GrallocTextureData*>((*it)->GetInternalData());
+        (*it)->ClearRecycleCallback();
         if (client->GetMediaBuffer()) {
-          mPendingVideoBuffers.push(BufferItem(client->GetMediaBuffer(), client->GetAndResetReleaseFenceHandle()));
+          mPendingVideoBuffers.push(BufferItem(client->GetMediaBuffer(), (*it)->GetAndResetReleaseFenceHandle()));
         }
       }
       mPendingRecycleTexutreClients.clear();
@@ -657,8 +653,7 @@ OmxDecoder::ReadVideo(VideoFrame *aFrame, int64_t aTimeUs,
       // Manually increment reference count to keep MediaBuffer alive
       // during TextureClient is in use.
       mVideoBuffer->add_ref();
-      GrallocTextureClientOGL* grallocClient = static_cast<GrallocTextureClientOGL*>(textureClient.get());
-      grallocClient->SetMediaBuffer(mVideoBuffer);
+      static_cast<GrallocTextureData*>(textureClient->GetInternalData())->SetMediaBuffer(mVideoBuffer);
       // Set recycle callback for TextureClient
       textureClient->SetRecycleCallback(OmxDecoder::RecycleCallback, this);
       {
@@ -921,9 +916,9 @@ OmxDecoder::RecycleCallbackImp(TextureClient* aClient)
       return;
     }
     mPendingRecycleTexutreClients.erase(aClient);
-    GrallocTextureClientOGL* client = static_cast<GrallocTextureClientOGL*>(aClient);
-    if (client->GetMediaBuffer()) {
-      mPendingVideoBuffers.push(BufferItem(client->GetMediaBuffer(), client->GetAndResetReleaseFenceHandle()));
+    GrallocTextureData* grallocData = static_cast<GrallocTextureData*>(aClient->GetInternalData());
+    if (grallocData->GetMediaBuffer()) {
+      mPendingVideoBuffers.push(BufferItem(grallocData->GetMediaBuffer(), aClient->GetAndResetReleaseFenceHandle()));
     }
   }
   sp<AMessage> notify =

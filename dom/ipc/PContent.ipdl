@@ -16,6 +16,7 @@ include protocol PCycleCollectWithLogs;
 include protocol PCrashReporter;
 include protocol PPSMContentDownloader;
 include protocol PExternalHelperApp;
+include protocol PHandlerService;
 include protocol PDeviceStorageRequest;
 include protocol PFileDescriptorSet;
 include protocol PFMRadio;
@@ -64,13 +65,12 @@ include PBackgroundSharedTypes;
 include PContentPermission;
 include BrowserConfiguration;
 include GraphicsMessages;
+include ProfilerTypes;
 
 // Workaround to prevent error if PContentChild.cpp & PContentBridgeParent.cpp
 // are put into different UnifiedProtocolsXX.cpp files.
 // XXX Remove this once bug 1069073 is fixed
 include "mozilla/dom/PContentBridgeParent.h";
-
-include "mozilla/dom/indexedDB/SerializationHelpers.h";
 
 using GeoPosition from "nsGeoPositionIPCSerialiser.h";
 
@@ -84,7 +84,6 @@ using class IPC::Principal from "mozilla/dom/PermissionMessageUtils.h";
 using struct mozilla::null_t from "ipc/IPCMessageUtils.h";
 using struct mozilla::void_t from "ipc/IPCMessageUtils.h";
 using mozilla::dom::NativeThreadId from "mozilla/dom/TabMessageUtils.h";
-using mozilla::dom::quota::PersistenceType from "mozilla/dom/quota/PersistenceType.h";
 using mozilla::hal::ProcessPriority from "mozilla/HalTypes.h";
 using mozilla::gfx::IntSize from "mozilla/gfx/2D.h";
 using mozilla::dom::TabId from "mozilla/dom/ipc/IdType.h";
@@ -277,6 +276,16 @@ struct FileSystemGetDirectoryListingParams
 {
   nsString filesystem;
   nsString realPath;
+  // 'filters' could be an array rather than a semicolon separated string
+  // (we'd then use InfallibleTArray<nsString> internally), but that is
+  // wasteful.  E10s requires us to pass the filters over as a string anyway,
+  // so avoiding using an array avoids serialization on the side passing the
+  // filters.  Since an nsString can share its buffer when copied,
+  // using that instead of InfallibleTArray<nsString> makes copying the filters
+  // around in any given process a bit more efficient too, since copying a
+  // single nsString is cheaper than copying InfallibleTArray member data and
+  // each nsString that it contains.
+  nsString filters;
 };
 
 struct FileSystemGetFileOrDirectoryParams
@@ -458,6 +467,7 @@ prio(normal upto urgent) sync protocol PContent
     manages PFileDescriptorSet;
     manages PFMRadio;
     manages PHal;
+    manages PHandlerService;
     manages PHeapSnapshotTempFileHelper;
     manages PIcc;
     manages PMedia;
@@ -652,8 +662,7 @@ child:
     /**
      * Control the Gecko Profiler in the child process.
      */
-    async StartProfiler(uint32_t aEntries, double aInterval, nsCString[] aFeatures,
-                        nsCString[] aThreadNameFilters);
+    async StartProfiler(ProfilerInitParams params);
     async StopProfiler();
     async PauseProfiler(bool aPause);
 
@@ -843,7 +852,7 @@ parent:
     async VisitURI(URIParams uri, OptionalURIParams referrer, uint32_t flags);
     async SetURITitle(URIParams uri, nsString title);
 
-    async LoadURIExternal(URIParams uri);
+    async LoadURIExternal(URIParams uri, PBrowser windowContext);
 
     // PrefService message
     sync ReadPrefsArray() returns (PrefSetting[] prefs);
@@ -890,6 +899,8 @@ parent:
                        int64_t aContentLength,
                        OptionalURIParams aReferrer,
                        nullable PBrowser aBrowser);
+
+    PHandlerService();
 
     AddGeolocationListener(Principal principal, bool highAccuracy);
     RemoveGeolocationListener();
@@ -962,7 +973,7 @@ parent:
 
     sync NotifyKeywordSearchLoading(nsString providerName, nsString keyword);
 
-    async CopyFavicon(URIParams oldURI, URIParams newURI, bool isPrivate);
+    async CopyFavicon(URIParams oldURI, URIParams newURI, Principal aLoadingPrincipal, bool isPrivate);
 
     // Tell the compositor to allocate a layer tree id for nested remote mozbrowsers.
     sync AllocateLayerTreeId()
@@ -1026,14 +1037,6 @@ parent:
      */
     sync KeygenProvideContent()
         returns (nsString aAttribute, nsString[] aContent);
-
-    // Use only for testing!
-    sync GetFileReferences(PersistenceType persistenceType,
-                           nsCString origin,
-                           nsString databaseName,
-                           int64_t fileId)
-      returns (int32_t refCnt, int32_t dBRefCnt, int32_t sliceRefCnt,
-               bool result);
 
     // Use only for testing!
     FlushPendingFileDeletions();
