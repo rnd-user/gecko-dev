@@ -281,10 +281,10 @@ SpeechRecognition::Transition(SpeechEvent* aEvent)
           break;
         case EVENT_RECOGNITIONSERVICE_INTERMEDIATE_RESULT:
         case EVENT_RECOGNITIONSERVICE_FINAL_RESULT:
-        case EVENT_RECOGNITIONSERVICE_ERROR:
           DoNothing(aEvent);
           break;
         case EVENT_AUDIO_ERROR:
+        case EVENT_RECOGNITIONSERVICE_ERROR:
           AbortError(aEvent);
           break;
         case EVENT_START:
@@ -306,11 +306,11 @@ SpeechRecognition::Transition(SpeechEvent* aEvent)
           AbortSilently(aEvent);
           break;
         case EVENT_AUDIO_ERROR:
+        case EVENT_RECOGNITIONSERVICE_ERROR:
           AbortError(aEvent);
           break;
         case EVENT_RECOGNITIONSERVICE_INTERMEDIATE_RESULT:
         case EVENT_RECOGNITIONSERVICE_FINAL_RESULT:
-        case EVENT_RECOGNITIONSERVICE_ERROR:
           DoNothing(aEvent);
           break;
         case EVENT_START:
@@ -576,6 +576,14 @@ SpeechRecognition::StartRecording(DOMMediaStream* aDOMStream)
   if (NS_WARN_IF(!mDOMStream->GetPlaybackStream())) {
     return NS_ERROR_UNEXPECTED;
   }
+
+  // must be done after a stream is acquired
+  // because deepspeech requires direct access to mDOMStream
+  nsresult rv = mRecognitionService->Initialize(this);
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return rv;
+  }
+
   mSpeechListener = new SpeechStreamListener(this);
   mDOMStream->GetPlaybackStream()->AddListener(mSpeechListener);
 
@@ -643,6 +651,13 @@ SpeechRecognition::ProcessTestEventRequest(nsISupports* aSubject, const nsAStrin
   }
 
   return;
+}
+
+already_AddRefed<DOMMediaStream>
+SpeechRecognition::MediaStream() const
+{
+  RefPtr<DOMMediaStream> aStream = mDOMStream;
+  return aStream.forget();
 }
 
 already_AddRefed<SpeechGrammarList>
@@ -713,14 +728,14 @@ SpeechRecognition::SetMaxAlternatives(uint32_t aArg)
 void
 SpeechRecognition::GetServiceURI(nsString& aRetVal, ErrorResult& aRv) const
 {
-  aRv.Throw(NS_ERROR_NOT_IMPLEMENTED);
+  aRetVal = mServiceURI;
   return;
 }
 
 void
 SpeechRecognition::SetServiceURI(const nsAString& aArg, ErrorResult& aRv)
 {
-  aRv.Throw(NS_ERROR_NOT_IMPLEMENTED);
+  mServiceURI = aArg;
   return;
 }
 
@@ -737,12 +752,6 @@ SpeechRecognition::Start(const Optional<NonNull<DOMMediaStream>>& aStream, Error
   }
 
   if (!ValidateAndSetGrammarList(aRv)) {
-    return;
-  }
-
-  nsresult rv;
-  rv = mRecognitionService->Initialize(this);
-  if (NS_WARN_IF(NS_FAILED(rv))) {
     return;
   }
 
@@ -777,6 +786,24 @@ SpeechRecognition::SetRecognitionService(ErrorResult& aRv)
     }
 
     return true;
+  }
+  
+  // try to select deepspeech
+  if (!mServiceURI.IsEmpty()) {
+    const nsSubstring& firstFive = Substring(mServiceURI, 0, 5);
+    const nsSubstring& firstSix = Substring(mServiceURI, 0, 6);
+
+    if (firstFive.EqualsLiteral("ws://") || firstSix.EqualsLiteral("wss://")) {
+      nsAutoCString aServiceCID;
+        aServiceCID = NS_SPEECH_RECOGNITION_SERVICE_CONTRACTID_PREFIX "deepspeech";
+      nsresult rv;
+      mRecognitionService = do_GetService(aServiceCID.get(), &rv);
+      if (!mRecognitionService) {
+        aRv.Throw(NS_ERROR_DOM_INVALID_STATE_ERR);
+        return false;
+      }
+      return true;
+    }
   }
 
   nsCOMPtr<nsPIDOMWindowInner> window = GetOwner();

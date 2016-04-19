@@ -73,6 +73,8 @@ public:
 
   already_AddRefed<SpeechGrammarList> Grammars() const;
 
+  already_AddRefed<DOMMediaStream> MediaStream() const;
+
   void SetGrammars(mozilla::dom::SpeechGrammarList& aArg);
 
   void GetLang(nsString& aRetVal) const;
@@ -252,6 +254,8 @@ private:
   bool mAborted;
 
   nsString mLang;
+
+  nsString mServiceURI;
 
   RefPtr<SpeechGrammarList> mSpeechGrammarList;
 

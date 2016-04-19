@@ -2720,6 +2720,7 @@ MOZ_VPX_ERROR_CONCEALMENT=
 MOZ_WEBSPEECH=1
 MOZ_WEBSPEECH_MODELS=
 MOZ_WEBSPEECH_POCKETSPHINX=
+MOZ_WEBSPEECH_DEEPSPEECH=1
 MOZ_WEBSPEECH_TEST_BACKEND=1
 VPX_USE_YASM=
 VPX_ASFLAGS=
@@ -3819,6 +3820,15 @@ if test -n "$MOZ_WEBSPEECH_POCKETSPHINX"; then
 fi
 
 AC_SUBST(MOZ_WEBSPEECH_POCKETSPHINX)
+
+dnl ========================================================
+dnl = Disable Speech API deepspeech backend
+dnl ========================================================
+if test -n "$MOZ_WEBSPEECH_DEEPSPEECH"; then
+    AC_DEFINE(MOZ_WEBSPEECH_DEEPSPEECH)
+fi
+
+AC_SUBST(MOZ_WEBSPEECH_DEEPSPEECH)
 
 dnl ========================================================
 dnl = Disable Speech API code

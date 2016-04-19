@@ -1,0 +1,27 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+* License, v. 2.0. If a copy of the MPL was not distributed with this file,
+* You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "nsISupports.idl"
+#include "mozIDOMWindow.idl"
+
+[scriptable, uuid(a8771df1-1c98-4abf-88d7-b235f5a31be3)]
+interface nsIDeepSpeechTransportListener : nsISupports {
+    void onOpen();
+    void onClose();
+    void onError(in nsresult aReason);
+    void onResult(in DOMString aTranscript, in float aConfidence, in boolean final);
+};
+
+[scriptable, uuid(ab0e2745-c755-48f3-b14d-15dac02b1acb)]
+interface nsIDeepSpeechTransport : nsISupports {
+    void start(
+        in mozIDOMWindow aWindow,
+        in nsIDeepSpeechTransportListener aListener,
+        in DOMString aURI,
+        in jsval aMediaStream,
+        in boolean continuous
+    );
+    void stop();
+    void abort();
+};
